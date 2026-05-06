@@ -88,7 +88,6 @@ const API = (() => {
                 stream: true,
                 temperature: options.temperature ?? 0.7,
                 top_p: options.topP ?? 1,
-                max_tokens: options.maxTokens ?? 4096,
                 frequency_penalty: options.frequencyPenalty ?? 0,
             };
 
@@ -199,7 +198,7 @@ const API = (() => {
 
             const body = {
                 model: options.model || 'claude-sonnet-4-20250514',
-                max_tokens: options.maxTokens ?? 4096,
+                max_tokens: 128000,
                 messages: filteredMessages.map(m => {
                     const msg = { role: m.role, content: m.content };
                     if (m.files?.length) {
@@ -317,7 +316,6 @@ const API = (() => {
                 generationConfig: {
                     temperature: options.temperature ?? 0.7,
                     topP: options.topP ?? 1,
-                    maxOutputTokens: options.maxTokens ?? 4096,
                 },
             };
 
@@ -392,7 +390,6 @@ const API = (() => {
                 options: {
                     temperature: options.temperature ?? 0.7,
                     top_p: options.topP ?? 1,
-                    num_predict: options.maxTokens ?? 4096,
                 },
             };
 
@@ -462,7 +459,6 @@ const API = (() => {
                 stream: true,
                 temperature: options.temperature ?? 0.7,
                 top_p: options.topP ?? 1,
-                max_tokens: options.maxTokens ?? 4096,
             };
 
             const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -539,7 +535,6 @@ const API = (() => {
                 stream: true,
                 temperature: options.temperature ?? 0.7,
                 top_p: options.topP ?? 1,
-                max_tokens: options.maxTokens ?? 4096,
             };
 
             const headers = { 'Content-Type': 'application/json' };

@@ -739,8 +739,33 @@ body {
     transition: opacity var(--transition);
 }
 
-.conversation-item:hover .conversation-delete {
+.conversation-rename {
+    opacity: 0;
+    transition: opacity var(--transition);
+}
+
+.conversation-item:hover .conversation-delete,
+.conversation-item:hover .conversation-rename {
     opacity: 1;
+}
+
+.conversation-item-actions {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    flex-shrink: 0;
+}
+
+.conversation-rename-input {
+    flex: 1;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 12px;
+    padding: 2px 4px;
+    outline: none;
+    font-family: var(--font-sans);
 }
 
 .empty-list {
@@ -1051,7 +1076,8 @@ body {
     margin-bottom: 6px;
 }
 
-.context-badge .remove-context {
+.context-badge .remove-context,
+.context-badge .remove-attachment {
     cursor: pointer;
     font-weight: bold;
     margin-left: 2px;

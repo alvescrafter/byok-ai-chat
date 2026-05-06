@@ -39,11 +39,6 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 // --- Message Handler ---
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
-        case 'SEND_MESSAGE':
-            handleSendMessage(message, sender);
-            sendResponse({ started: true });
-            return false;
-
         case 'CAPTURE_SCREENSHOT':
             handleCaptureScreenshot(sender, sendResponse);
             return true; // async
@@ -77,43 +72,64 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 });
 
-// --- Handler: Send Message (Streaming) ---
-async function handleSendMessage(message, sender) {
-    const { messages, options, settings } = message;
-    const senderTabId = sender.tab?.id;
+// --- Port-based Streaming Handler ---
+// The side panel opens a port via chrome.runtime.connect() for streaming.
+// This is the ONLY reliable way to stream from service worker → side panel.
+chrome.runtime.onConnect.addListener((port) => {
+    if (port.name !== 'ai-stream') return;
 
-    try {
-        const stream = API.sendMessage(messages, options, settings);
-        let fullContent = '';
+    port.onMessage.addListener(async (message) => {
+        if (message.type !== 'SEND_MESSAGE') return;
 
-        for await (const chunk of stream) {
-            fullContent += chunk;
-            // Send streaming chunks to side panel
-            chrome.runtime.sendMessage({
-                type: 'STREAM_CHUNK',
-                content: chunk,
-                fullContent,
-                provider: options.provider,
-                model: options.model,
-            }).catch(() => { /* panel may be closed */ });
+        const { messages, options, settings } = message;
+
+        try {
+            const stream = API.sendMessage(messages, options, settings);
+            let fullContent = '';
+
+            for await (const chunk of stream) {
+                fullContent += chunk;
+                // Send streaming chunks back through the port
+                try {
+                    port.postMessage({
+                        type: 'STREAM_CHUNK',
+                        content: chunk,
+                        fullContent,
+                        provider: options.provider,
+                        model: options.model,
+                    });
+                } catch (e) {
+                    // Port disconnected — panel was closed
+                    break;
+                }
+            }
+
+            // Send completion signal
+            try {
+                port.postMessage({
+                    type: 'STREAM_DONE',
+                    content: fullContent,
+                    provider: options.provider,
+                    model: options.model,
+                });
+            } catch (e) { /* port closed */ }
+        } catch (error) {
+            try {
+                port.postMessage({
+                    type: 'STREAM_ERROR',
+                    error: error.message,
+                    provider: options.provider,
+                    model: options.model,
+                });
+            } catch (e) { /* port closed */ }
         }
+    });
 
-        // Send completion signal
-        chrome.runtime.sendMessage({
-            type: 'STREAM_DONE',
-            content: fullContent,
-            provider: options.provider,
-            model: options.model,
-        }).catch(() => {});
-    } catch (error) {
-        chrome.runtime.sendMessage({
-            type: 'STREAM_ERROR',
-            error: error.message,
-            provider: options.provider,
-            model: options.model,
-        }).catch(() => {});
-    }
-}
+    // Clean up when port disconnects
+    port.onDisconnect.addListener(() => {
+        // Could abort any in-flight request here if needed
+    });
+});
 
 // --- Handler: Capture Screenshot ---
 async function handleCaptureScreenshot(sender, sendResponse) {
@@ -267,7 +283,6 @@ function getDefaultSettings() {
         defaultSystemPrompt: 'You are a helpful assistant.',
         defaultTemperature: 0.7,
         defaultTopP: 1,
-        defaultMaxTokens: 4096,
         contextMode: 'truncate',
         maxContextMessages: 50,
     };

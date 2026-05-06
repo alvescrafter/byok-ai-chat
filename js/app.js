@@ -13,6 +13,8 @@ const App = (() => {
     let presets = [];
     let pageContext = null;   // attached page context
     let screenshotData = null; // attached screenshot data URL
+    let attachedFiles = [];     // attached files (images + text)
+    let streamPort = null;     // port for streaming communication with service worker
 
     // --- DOM References ---
     const $ = (id) => document.getElementById(id);
@@ -46,16 +48,13 @@ const App = (() => {
         // Populate settings form
         populateSettingsForm();
 
-        // Populate presets
-        renderPresets();
-
         // Init markdown copy handlers
         Markdown.initCopyHandlers($('chat-container'));
 
         // Bind events
         bindEvents();
 
-        // Listen for messages from service worker (streaming, context menu)
+        // Listen for messages from service worker (context menu text, etc.)
         chrome.runtime.onMessage.addListener(handleBackgroundMessage);
 
         // Update token counter on input
@@ -122,6 +121,17 @@ const App = (() => {
         // Page context
         $('page-context-btn').addEventListener('click', handlePageContext);
 
+        // File attachment
+        $('attach-file-btn').addEventListener('click', () => $('file-input').click());
+        $('file-input').addEventListener('change', handleFileAttach);
+
+        // Conversation rename event
+        document.addEventListener('conversation-renamed', (e) => {
+            const { id, title } = e.detail;
+            Storage.updateConversation(id, { title });
+            loadConversationList();
+        });
+
         // Export
         $('export-btn').addEventListener('click', () => UI.openModal('export-modal'));
         $('do-export-btn').addEventListener('click', handleExport);
@@ -145,34 +155,14 @@ const App = (() => {
         document.querySelectorAll('.test-connection-btn').forEach(btn => {
             btn.addEventListener('click', () => handleTestConnection(btn.dataset.provider, btn));
         });
-
-        // Preset chips in settings
-        $('preset-list')?.addEventListener('click', (e) => {
-            const chip = e.target.closest('.preset-chip');
-            if (chip) {
-                const presetId = chip.dataset.presetId;
-                const preset = presets.find(p => p.id === presetId);
-                if (preset) {
-                    $('system-prompt').value = preset.prompt;
-                    document.querySelectorAll('#preset-list .preset-chip').forEach(c => c.classList.remove('active'));
-                    chip.classList.add('active');
-                }
-            }
-        });
     }
 
     // --- Handle Background Messages (from service worker) ---
     function handleBackgroundMessage(message) {
+        // Only handle non-streaming messages here.
+        // Stream events (STREAM_CHUNK, STREAM_DONE, STREAM_ERROR) now arrive
+        // through the port opened by chrome.runtime.connect().
         switch (message.type) {
-            case 'STREAM_CHUNK':
-                handleStreamChunk(message);
-                break;
-            case 'STREAM_DONE':
-                handleStreamDone(message);
-                break;
-            case 'STREAM_ERROR':
-                handleStreamError(message);
-                break;
             case 'CONTEXT_MENU_TEXT':
                 handleContextMenuText(message);
                 break;
@@ -183,7 +173,7 @@ const App = (() => {
     async function handleSend() {
         const input = $('message-input');
         const text = input.value.trim();
-        if (!text && !screenshotData && !pageContext) return;
+        if (!text && !screenshotData && !pageContext && attachedFiles.length === 0) return;
         if (isStreaming) return;
 
         // Ensure we have a conversation
@@ -210,6 +200,26 @@ const App = (() => {
                 data: screenshotData,
                 size: 0,
             });
+        }
+
+        // Add attached files
+        for (const file of attachedFiles) {
+            if (file.type?.startsWith('image/')) {
+                userMessage.files.push({
+                    name: file.name,
+                    type: file.type,
+                    data: file.data,
+                    size: file.size,
+                });
+            } else {
+                // Text file: add content as file entry
+                userMessage.files.push({
+                    name: file.name,
+                    type: file.type,
+                    content: file.content,
+                    size: file.size,
+                });
+            }
         }
 
         // Add page context as text content prefix
@@ -251,8 +261,34 @@ const App = (() => {
         const assistantMsg = { id: Storage.generateId(), role: 'assistant', content: '', timestamp: Date.now(), files: [] };
         renderAssistantMessage(assistantMsg, true);
 
-        // Send to service worker
-        chrome.runtime.sendMessage({
+        // Send to service worker via port-based streaming
+        // chrome.runtime.sendMessage is unreliable for service worker → side panel.
+        // Instead, open a port and send/receive through it.
+        streamPort = chrome.runtime.connect({ name: 'ai-stream' });
+
+        streamPort.onMessage.addListener((msg) => {
+            switch (msg.type) {
+                case 'STREAM_CHUNK':
+                    handleStreamChunk(msg);
+                    break;
+                case 'STREAM_DONE':
+                    handleStreamDone(msg);
+                    break;
+                case 'STREAM_ERROR':
+                    handleStreamError(msg);
+                    break;
+            }
+        });
+
+        streamPort.onDisconnect.addListener(() => {
+            // Port closed (service worker restarted or panel closed)
+            if (isStreaming) {
+                handleStreamError({ error: 'Connection to service worker lost.' });
+            }
+            streamPort = null;
+        });
+
+        streamPort.postMessage({
             type: 'SEND_MESSAGE',
             messages,
             options: {
@@ -260,7 +296,6 @@ const App = (() => {
                 model: $('model-select').value,
                 temperature: settings.defaultTemperature ?? 0.7,
                 topP: settings.defaultTopP ?? 1,
-                maxTokens: settings.defaultMaxTokens ?? 4096,
                 abortSignal: null, // can't pass AbortSignal across message boundary
             },
             settings,
@@ -300,6 +335,12 @@ const App = (() => {
         abortController = null;
         updateSendButton();
 
+        // Close the streaming port
+        if (streamPort) {
+            streamPort.disconnect();
+            streamPort = null;
+        }
+
         // Save assistant message
         if (currentConversationId && streamingContent) {
             await Storage.addMessage(currentConversationId, {
@@ -316,6 +357,12 @@ const App = (() => {
         isStreaming = false;
         abortController = null;
         updateSendButton();
+
+        // Close the streaming port
+        if (streamPort) {
+            streamPort.disconnect();
+            streamPort = null;
+        }
 
         // Show error message
         if (currentConversationId) {
@@ -502,7 +549,31 @@ const App = (() => {
                 const assistantMsg = { id: Storage.generateId(), role: 'assistant', content: '', timestamp: Date.now(), files: [] };
                 renderAssistantMessage(assistantMsg, true);
 
-                chrome.runtime.sendMessage({
+                // Use port-based streaming for regeneration too
+                streamPort = chrome.runtime.connect({ name: 'ai-stream' });
+
+                streamPort.onMessage.addListener((msg) => {
+                    switch (msg.type) {
+                        case 'STREAM_CHUNK':
+                            handleStreamChunk(msg);
+                            break;
+                        case 'STREAM_DONE':
+                            handleStreamDone(msg);
+                            break;
+                        case 'STREAM_ERROR':
+                            handleStreamError(msg);
+                            break;
+                    }
+                });
+
+                streamPort.onDisconnect.addListener(() => {
+                    if (isStreaming) {
+                        handleStreamError({ error: 'Connection to service worker lost.' });
+                    }
+                    streamPort = null;
+                });
+
+                streamPort.postMessage({
                     type: 'SEND_MESSAGE',
                     messages,
                     options: {
@@ -510,7 +581,6 @@ const App = (() => {
                         model: $('model-select').value,
                         temperature: settings.defaultTemperature ?? 0.7,
                         topP: settings.defaultTopP ?? 1,
-                        maxTokens: settings.defaultMaxTokens ?? 4096,
                     },
                     settings,
                 });
@@ -588,6 +658,52 @@ const App = (() => {
         }
     }
 
+    // --- File Attachment ---
+    function handleFileAttach(e) {
+        const files = Array.from(e.target.files || []);
+        if (!files.length) return;
+
+        for (const file of files) {
+            if (file.size > 10 * 1024 * 1024) {
+                UI.toast(`${file.name} is too large (max 10MB)`, 'error');
+                continue;
+            }
+
+            if (file.type?.startsWith('image/')) {
+                // Read image as data URL
+                const reader = new FileReader();
+                reader.onload = () => {
+                    attachedFiles.push({
+                        name: file.name,
+                        type: file.type,
+                        data: reader.result,
+                        size: file.size,
+                    });
+                    renderAttachmentPreviews();
+                };
+                reader.readAsDataURL(file);
+            } else {
+                // Read text-based file as text
+                const reader = new FileReader();
+                reader.onload = () => {
+                    attachedFiles.push({
+                        name: file.name,
+                        type: file.type || 'text/plain',
+                        content: reader.result,
+                        size: file.size,
+                    });
+                    renderAttachmentPreviews();
+                };
+                reader.readAsText(file);
+            }
+        }
+
+        UI.toast(`${files.length} file${files.length > 1 ? 's' : ''} attached`, 'success');
+
+        // Reset file input so the same file can be re-attached
+        e.target.value = '';
+    }
+
     // --- Attachment Previews ---
     function renderAttachmentPreviews() {
         const container = $('attachment-previews');
@@ -620,11 +736,30 @@ const App = (() => {
             });
             container.appendChild(badge);
         }
+
+        // Render attached file previews
+        for (let i = 0; i < attachedFiles.length; i++) {
+            const file = attachedFiles[i];
+            container.style.display = 'block';
+            const badge = document.createElement('div');
+            badge.className = 'context-badge';
+            if (file.type?.startsWith('image/')) {
+                badge.innerHTML = `🖼️ ${file.name} <span class="remove-attachment" data-index="${i}">×</span>`;
+            } else {
+                badge.innerHTML = `📎 ${file.name} <span class="remove-attachment" data-index="${i}">×</span>`;
+            }
+            badge.querySelector('.remove-attachment').addEventListener('click', () => {
+                attachedFiles.splice(i, 1);
+                renderAttachmentPreviews();
+            });
+            container.appendChild(badge);
+        }
     }
 
     function clearAttachments() {
         screenshotData = null;
         pageContext = null;
+        attachedFiles = [];
         const container = $('attachment-previews');
         container.innerHTML = '';
         container.style.display = 'none';
@@ -686,6 +821,12 @@ const App = (() => {
             Storage.updateConversation(currentConversationId, { provider, model });
         }
         $('model-info').textContent = `${provider}/${model}`;
+
+        // Persist LLM choice across sessions
+        settings.defaultProvider = provider;
+        settings.defaultModel = model;
+        Storage.saveSettings(settings);
+        chrome.runtime.sendMessage({ type: 'SAVE_SETTINGS', settings });
     }
 
     // --- Settings ---
@@ -701,10 +842,6 @@ const App = (() => {
         $('custom-baseurl').value = p.custom?.baseUrl || '';
         $('custom-apikey').value = p.custom?.apiKey || '';
         $('custom-model').value = p.custom?.model || '';
-        $('system-prompt').value = settings.defaultSystemPrompt || 'You are a helpful assistant.';
-        $('temperature').value = settings.defaultTemperature ?? 0.7;
-        $('top-p').value = settings.defaultTopP ?? 1;
-        $('max-tokens').value = settings.defaultMaxTokens ?? 4096;
     }
 
     async function handleSaveSettings() {
@@ -716,11 +853,6 @@ const App = (() => {
             lmstudio: { apiKey: '', baseUrl: $('lmstudio-baseurl').value || 'http://localhost:1234/v1' },
             custom: { apiKey: $('custom-apikey').value, baseUrl: $('custom-baseurl').value, model: $('custom-model').value },
         };
-        settings.defaultSystemPrompt = $('system-prompt').value;
-        settings.defaultTemperature = parseFloat($('temperature').value) || 0.7;
-        settings.defaultTopP = parseFloat($('top-p').value) || 1;
-        settings.defaultMaxTokens = parseInt($('max-tokens').value) || 4096;
-
         await Storage.saveSettings(settings);
 
         // Also save to service worker
@@ -771,20 +903,6 @@ const App = (() => {
                 btn.className = 'test-connection-btn';
             }, 3000);
         });
-    }
-
-    // --- Presets ---
-    function renderPresets() {
-        const list = $('preset-list');
-        if (!list) return;
-        list.innerHTML = '';
-        for (const preset of presets) {
-            const chip = document.createElement('span');
-            chip.className = 'preset-chip';
-            chip.dataset.presetId = preset.id;
-            chip.textContent = preset.name;
-            list.appendChild(chip);
-        }
     }
 
     // --- Theme ---

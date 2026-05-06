@@ -230,7 +230,6 @@ const Storage = (() => {
             defaultSystemPrompt: 'You are a helpful assistant.',
             defaultTemperature: 0.7,
             defaultTopP: 1,
-            defaultMaxTokens: 4096,
             contextMode: 'truncate',
             maxContextMessages: 50,
             enableVoiceInput: false,

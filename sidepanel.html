@@ -83,6 +83,10 @@
             <div class="input-row">
                 <textarea id="message-input" class="input-textarea" placeholder="Type a message..." rows="1"></textarea>
                 <div class="input-actions">
+                    <button id="attach-file-btn" class="btn btn-ghost btn-icon" title="Attach file">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                    </button>
+                    <input type="file" id="file-input" multiple accept="image/*,.txt,.md,.json,.csv,.py,.js,.html,.css,.xml,.yaml,.yml,.log,.pdf,.doc,.docx" style="display:none">
                     <button id="screenshot-btn" class="btn btn-ghost btn-icon" title="Capture screenshot">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
                     </button>
@@ -225,29 +229,7 @@
                     </div>
                 </div>
 
-                <!-- General Settings -->
-                <div class="settings-section">
-                    <h4>General</h4>
-                    <div class="settings-group">
-                        <label>System Prompt</label>
-                        <div class="preset-list" id="preset-list"></div>
-                        <textarea id="system-prompt" class="text-input" rows="3" placeholder="You are a helpful assistant.">You are a helpful assistant.</textarea>
-                    </div>
-                    <div class="settings-row">
-                        <div class="settings-group">
-                            <label>Temperature</label>
-                            <input type="number" id="temperature" class="text-input" min="0" max="2" step="0.1" value="0.7">
-                        </div>
-                        <div class="settings-group">
-                            <label>Top P</label>
-                            <input type="number" id="top-p" class="text-input" min="0" max="1" step="0.05" value="1">
-                        </div>
-                        <div class="settings-group">
-                            <label>Max Tokens</label>
-                            <input type="number" id="max-tokens" class="text-input" min="1" max="128000" step="256" value="4096">
-                        </div>
-                    </div>
-                </div>
+
             </div>
             <div class="modal-footer">
                 <button id="save-settings-btn" class="btn btn-primary">Save Settings</button>

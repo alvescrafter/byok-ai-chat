@@ -161,15 +161,78 @@ const UI = (() => {
             title.className = 'conversation-title';
             title.textContent = convo.title || 'New Chat';
 
+            // Double-click to rename
+            title.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                startRename(convo.id, title, convo.title || 'New Chat');
+            });
+
+            const actionsDiv = document.createElement('div');
+            actionsDiv.className = 'conversation-item-actions';
+
+            const renameBtn = document.createElement('button');
+            renameBtn.className = 'btn btn-ghost btn-sm conversation-rename';
+            renameBtn.title = 'Rename conversation';
+            renameBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`;
+            renameBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                startRename(convo.id, title, convo.title || 'New Chat');
+            });
+
             const delBtn = document.createElement('button');
             delBtn.className = 'btn btn-ghost btn-sm conversation-delete';
             delBtn.title = 'Delete conversation';
             delBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`;
 
+            actionsDiv.appendChild(renameBtn);
+            actionsDiv.appendChild(delBtn);
+
             item.appendChild(title);
-            item.appendChild(delBtn);
+            item.appendChild(actionsDiv);
             container.appendChild(item);
         }
+    }
+
+    function startRename(convoId, titleEl, currentTitle) {
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'conversation-rename-input';
+        input.value = currentTitle;
+        input.style.width = '100%';
+
+        titleEl.replaceWith(input);
+        input.focus();
+        input.select();
+
+        const finish = () => {
+            const newTitle = input.value.trim() || 'New Chat';
+            const newTitleEl = document.createElement('span');
+            newTitleEl.className = 'conversation-title';
+            newTitleEl.textContent = newTitle;
+            newTitleEl.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                startRename(convoId, newTitleEl, newTitle);
+            });
+            input.replaceWith(newTitleEl);
+
+            if (newTitle !== currentTitle) {
+                // Dispatch custom event for app.js to handle
+                const event = new CustomEvent('conversation-renamed', { detail: { id: convoId, title: newTitle } });
+                document.dispatchEvent(event);
+            }
+        };
+
+        input.addEventListener('blur', finish, { once: true });
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                input.blur();
+            }
+            if (e.key === 'Escape') {
+                input.value = currentTitle;
+                input.blur();
+            }
+        });
     }
 
     // --- Provider/Model Dropdowns ---
