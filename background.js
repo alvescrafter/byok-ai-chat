@@ -67,6 +67,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             handleSaveSettings(message, sendResponse);
             return true; // async
 
+        case 'GET_YOUTUBE_TRANSCRIPT':
+            handleGetYoutubeTranscript(sendResponse);
+            return true; // async
+
         default:
             return false;
     }
@@ -286,4 +290,196 @@ function getDefaultSettings() {
         contextMode: 'truncate',
         maxContextMessages: 50,
     };
+}
+
+// --- Handler: Get YouTube Transcript ---
+async function handleGetYoutubeTranscript(sendResponse) {
+    try {
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (!tab) {
+            sendResponse({ success: false, error: 'No active tab found' });
+            return;
+        }
+
+        const videoId = extractVideoId(tab.url);
+        if (!videoId) {
+            sendResponse({ success: false, error: 'Not a YouTube video page' });
+            return;
+        }
+
+        // Fetch the YouTube watch page HTML
+        const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        const response = await fetch(watchUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
+        });
+
+        if (!response.ok) {
+            sendResponse({ success: false, error: `Failed to fetch YouTube page (${response.status})` });
+            return;
+        }
+
+        const html = await response.text();
+
+        // Extract ytInitialPlayerResponse from the page HTML
+        const playerResponse = extractPlayerResponse(html);
+        if (!playerResponse) {
+            sendResponse({ success: false, error: 'Could not parse YouTube page data' });
+            return;
+        }
+
+        // Get caption tracks
+        const captionTracks = extractCaptionTracks(playerResponse);
+        if (!captionTracks || captionTracks.length === 0) {
+            sendResponse({ success: false, error: 'No captions available for this video' });
+            return;
+        }
+
+        // Prefer English captions, fall back to first available
+        let track = captionTracks.find(t => t.languageCode?.startsWith('en')) || captionTracks[0];
+
+        // Fetch the caption XML
+        const captionUrl = track.baseUrl + '&fmt=srv3';
+        const captionResponse = await fetch(captionUrl);
+        if (!captionResponse.ok) {
+            sendResponse({ success: false, error: 'Failed to fetch captions' });
+            return;
+        }
+
+        const captionXml = await captionResponse.text();
+        const transcript = parseCaptionXml(captionXml);
+
+        if (!transcript || transcript.trim().length === 0) {
+            sendResponse({ success: false, error: 'Transcript is empty' });
+            return;
+        }
+
+        // Truncate if too long (same limit as page context)
+        const maxLen = 8000;
+        const finalTranscript = transcript.length > maxLen
+            ? transcript.substring(0, maxLen) + '... [truncated]'
+            : transcript;
+
+        // Extract video title from the page
+        const titleMatch = html.match(/<title>(.*?)<\/title>/);
+        const videoTitle = titleMatch ? titleMatch[1].replace(' - YouTube', '') : `YouTube Video ${videoId}`;
+
+        sendResponse({
+            success: true,
+            transcript: finalTranscript,
+            title: videoTitle,
+            videoId,
+            url: watchUrl,
+            language: track.languageCode || track.name?.simpleText || 'unknown',
+        });
+    } catch (error) {
+        sendResponse({ success: false, error: error.message });
+    }
+}
+
+// --- YouTube Helper: Extract Video ID ---
+function extractVideoId(url) {
+    if (!url) return null;
+    // Match standard watch URLs, shorts, embeds, and various YouTube domains
+    const patterns = [
+        /(?:youtube\.com\/watch\?.*v=|youtu\.be\/|youtube\.com\/shorts\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+        /youtube\.com\/watch\?.*v=([a-zA-Z0-9_-]{11})/,
+    ];
+    for (const pattern of patterns) {
+        const match = url.match(pattern);
+        if (match) return match[1];
+    }
+    return null;
+}
+
+// --- YouTube Helper: Extract Player Response from HTML ---
+function extractPlayerResponse(html) {
+    // Try to find ytInitialPlayerResponse in the page scripts
+    const patterns = [
+        /var\s+ytInitialPlayerResponse\s*=\s*(\{.+?\});/s,
+        /ytInitialPlayerResponse\s*=\s*(\{.+?\});/s,
+        /"playerCaptionsTracklistRenderer"/,
+    ];
+
+    for (let i = 0; i < patterns.length - 1; i++) {
+        const match = html.match(patterns[i]);
+        if (match) {
+            try {
+                return JSON.parse(match[1]);
+            } catch (e) {
+                // JSON parse failed, try next pattern
+                continue;
+            }
+        }
+    }
+
+    // Fallback: try to find captions data in ytInitialData
+    const dataMatch = html.match(/var\s+ytInitialData\s*=\s*(\{.+?\});/s);
+    if (dataMatch) {
+        try {
+            const data = JSON.parse(dataMatch[1]);
+            // Navigate through ytInitialData to find player response
+            const contents = data?.contents?.twoColumnWatchNextResults;
+            if (contents) {
+                // This path may vary; try to extract what we can
+            }
+        } catch (e) { /* ignore */ }
+    }
+
+    return null;
+}
+
+// --- YouTube Helper: Extract Caption Tracks from Player Response ---
+function extractCaptionTracks(playerResponse) {
+    try {
+        const captionTracks =
+            playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks ||
+            playerResponse?.playerCaptionsTracklistRenderer?.captionTracks ||
+            [];
+
+        return captionTracks.map(track => ({
+            baseUrl: track.baseUrl,
+            languageCode: track.languageCode || '',
+            name: track.name,
+            kind: track.kind || '', // 'asr' = auto-generated
+        }));
+    } catch (e) {
+        return [];
+    }
+}
+
+// --- YouTube Helper: Parse Caption XML ---
+function parseCaptionXml(xml) {
+    try {
+        // YouTube caption XML uses <text start="..." dur="...">content</text>
+        const textRegex = /<text[^>]*>([\s\S]*?)<\/text>/g;
+        const segments = [];
+        let match;
+
+        while ((match = textRegex.exec(xml)) !== null) {
+            let text = match[1];
+            // Decode HTML entities
+            text = text
+                .replace(/&amp;/g, '&')
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .replace(/&quot;/g, '"')
+                .replace(/&#39;/g, "'")
+                .replace(/&apos;/g, "'")
+                .replace(/&nbsp;/g, ' ')
+                // Remove nested HTML tags (e.g. <font> styling)
+                .replace(/<[^>]+>/g, '');
+            // Collapse whitespace
+            text = text.replace(/\s+/g, ' ').trim();
+            if (text) {
+                segments.push(text);
+            }
+        }
+
+        return segments.join(' ');
+    } catch (e) {
+        return '';
+    }
 }
