@@ -25,6 +25,13 @@ if (Test-Path $packagePath) {
 }
 New-Item -ItemType Directory -Path $packagePath -Force | Out-Null
 
+# Clean up old timestamped package folders from previous builds
+Get-ChildItem -Path $root -Directory -Filter "byok-ai-chat-v*" -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($_.Name -ne $packageName) {
+        Remove-Item -Path $_.FullName -Recurse -Force
+    }
+}
+
 Write-Host "Building $packageName..." -ForegroundColor Cyan
 
 # Files and folders to include
