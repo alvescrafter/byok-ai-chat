@@ -1,8 +1,19 @@
 # Dependencies
 node_modules/
 
+# Build artifacts
+build/
+*.zip
+*.log
+
+# Screenshots and store assets (kept locally, not in repo)
+store/screenshots/*.png
+store/promo/*.png
+
 # OS files
 .DS_Store
+Thumbs.db
+
 Thumbs.db
 desktop.ini
 

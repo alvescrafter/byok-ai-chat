@@ -89,10 +89,25 @@ BYOK AI Chat/
 
 ## 🛡️ Privacy
 
+See [PRIVACY.md](PRIVACY.md) for the full privacy policy. Summary:
+
 - All API keys are stored locally in `chrome.storage.local`
 - No data is sent to any third-party servers (only to your configured AI provider)
 - No analytics, no tracking, no telemetry
 - Conversations are stored locally in your browser
+- Open source — you can audit every line of code
+
+## 📦 Building for Chrome Web Store
+
+To package the extension for submission:
+
+```powershell
+.\build.ps1
+```
+
+This creates a clean `.zip` in the project root (e.g. `byok-ai-chat-v1.0.0-20260602-143022.zip`) ready to upload to the [Chrome Web Store Developer Dashboard](https://chrome.google.com/webstore/devconsole).
+
+See [store/DESCRIPTION.md](store/DESCRIPTION.md) for the store listing copy and screenshot requirements.
 
 ## 💝 Support
 
