@@ -14,7 +14,6 @@ const App = (() => {
     let pageContext = null;   // attached page context
     let screenshotData = null; // attached screenshot data URL
     let attachedFiles = [];     // attached files (images + text)
-    let youtubeTranscript = null; // attached YouTube transcript
     let streamPort = null;     // port for streaming communication with service worker
 
     // --- DOM References ---
@@ -57,16 +56,6 @@ const App = (() => {
 
         // Listen for messages from service worker (context menu text, etc.)
         chrome.runtime.onMessage.addListener(handleBackgroundMessage);
-
-        // Update YouTube button state when active tab changes
-        if (chrome.tabs?.onActivated) {
-            chrome.tabs.onActivated.addListener(() => updateYoutubeButtonState());
-        }
-        if (chrome.tabs?.onUpdated) {
-            chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-                if (changeInfo.url) updateYoutubeButtonState();
-            });
-        }
 
         // Update token counter on input
         updateTokenCounter();
@@ -136,10 +125,6 @@ const App = (() => {
         $('attach-file-btn').addEventListener('click', () => $('file-input').click());
         $('file-input').addEventListener('change', handleFileAttach);
 
-        // YouTube transcript
-        $('youtube-transcript-btn').addEventListener('click', handleYoutubeTranscript);
-        updateYoutubeButtonState();
-
         // Conversation rename event
         document.addEventListener('conversation-renamed', (e) => {
             const { id, title } = e.detail;
@@ -188,7 +173,7 @@ const App = (() => {
     async function handleSend() {
         const input = $('message-input');
         const text = input.value.trim();
-        if (!text && !screenshotData && !pageContext && !youtubeTranscript && attachedFiles.length === 0) return;
+        if (!text && !screenshotData && !pageContext && attachedFiles.length === 0) return;
         if (isStreaming) return;
 
         // Ensure we have a conversation
@@ -248,12 +233,6 @@ const App = (() => {
             }
             contextText += '\n[/Page Context]\n\n';
             userMessage.content = contextText + userMessage.content;
-        }
-
-        // Add YouTube transcript as text content prefix
-        if (youtubeTranscript) {
-            let ytText = `[YouTube Transcript]\nTitle: ${youtubeTranscript.title}\nURL: ${youtubeTranscript.url}\nLanguage: ${youtubeTranscript.language}\n\n${youtubeTranscript.transcript}\n[/YouTube Transcript]\n\n`;
-            userMessage.content = ytText + userMessage.content;
         }
 
         // Save user message
@@ -679,50 +658,6 @@ const App = (() => {
         }
     }
 
-    // --- YouTube Transcript ---
-    async function handleYoutubeTranscript() {
-        try {
-            UI.toast('Extracting transcript...', 'info', 5000);
-            chrome.runtime.sendMessage({ type: 'GET_YOUTUBE_TRANSCRIPT' }, (response) => {
-                if (response?.success) {
-                    youtubeTranscript = {
-                        transcript: response.transcript,
-                        title: response.title,
-                        url: response.url,
-                        videoId: response.videoId,
-                        language: response.language,
-                    };
-                    renderAttachmentPreviews();
-                    UI.toast('YouTube transcript attached!', 'success');
-                } else {
-                    UI.toast(response?.error || 'Failed to get YouTube transcript', 'error');
-                }
-            });
-        } catch (e) {
-            UI.toast('Failed to get YouTube transcript', 'error');
-        }
-    }
-
-    // --- YouTube Button State ---
-    async function updateYoutubeButtonState() {
-        try {
-            const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-            const btn = $('youtube-transcript-btn');
-            if (!btn) return;
-
-            const isYoutube = tab?.url && /^https?:\/\/(www\.)?youtube\.com\/watch/.test(tab.url);
-            if (isYoutube) {
-                btn.classList.remove('btn-youtube-disabled');
-                btn.title = 'Extract YouTube transcript';
-            } else {
-                btn.classList.add('btn-youtube-disabled');
-                btn.title = 'Not a YouTube video page';
-            }
-        } catch (e) {
-            // Ignore errors (e.g. during startup)
-        }
-    }
-
     // --- File Attachment ---
     function handleFileAttach(e) {
         const files = Array.from(e.target.files || []);
@@ -802,18 +737,6 @@ const App = (() => {
             container.appendChild(badge);
         }
 
-        if (youtubeTranscript) {
-            container.style.display = 'block';
-            const badge = document.createElement('div');
-            badge.className = 'youtube-badge';
-            badge.innerHTML = `▶️ ${youtubeTranscript.title || 'YouTube Transcript'} <span class="remove-youtube">×</span>`;
-            badge.querySelector('.remove-youtube').addEventListener('click', () => {
-                youtubeTranscript = null;
-                renderAttachmentPreviews();
-            });
-            container.appendChild(badge);
-        }
-
         // Render attached file previews
         for (let i = 0; i < attachedFiles.length; i++) {
             const file = attachedFiles[i];
@@ -837,7 +760,6 @@ const App = (() => {
         screenshotData = null;
         pageContext = null;
         attachedFiles = [];
-        youtubeTranscript = null;
         const container = $('attachment-previews');
         container.innerHTML = '';
         container.style.display = 'none';
