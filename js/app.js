@@ -29,7 +29,8 @@ const App = (() => {
         // Apply theme
         const theme = await Storage.getTheme();
         document.documentElement.dataset.theme = theme;
-        updateThemeIcon(theme);
+        $('theme-select').value = theme;
+        updateHljsTheme(theme);
 
         // Apply web search toggle from settings
         webSearchEnabled = settings.webSearchEnabled || false;
@@ -61,9 +62,6 @@ const App = (() => {
 
         // Listen for messages from service worker (context menu text, etc.)
         chrome.runtime.onMessage.addListener(handleBackgroundMessage);
-
-        // Update token counter on input
-        updateTokenCounter();
     }
 
     // --- Event Binding ---
@@ -78,7 +76,6 @@ const App = (() => {
         });
         $('message-input').addEventListener('input', () => {
             autoResizeTextarea();
-            updateTokenCounter();
         });
 
         // Provider/model changes
@@ -98,8 +95,8 @@ const App = (() => {
         // Search
         $('search-input').addEventListener('input', handleSearch);
 
-        // Theme toggle
-        $('theme-toggle-btn').addEventListener('click', handleThemeToggle);
+        // Theme dropdown
+        $('theme-select').addEventListener('change', (e) => handleThemeChange(e.target.value));
 
         // Settings
         $('settings-btn').addEventListener('click', () => UI.openModal('settings-modal'));
@@ -254,7 +251,6 @@ const App = (() => {
         input.value = '';
         autoResizeTextarea();
         clearAttachments();
-        updateTokenCounter();
 
         // Hide welcome screen
         hideWelcomeScreen();
@@ -953,7 +949,6 @@ Use the above search results to inform your answer. Cite sources using [number] 
             $('message-input').value = message.text;
             $('message-input').focus();
             autoResizeTextarea();
-            updateTokenCounter();
         }
     }
 
@@ -1091,30 +1086,19 @@ Use the above search results to inform your answer. Cite sources using [number] 
     }
 
     // --- Theme ---
-    async function handleThemeToggle() {
-        const current = document.documentElement.dataset.theme;
-        const next = current === 'dark' ? 'light' : 'dark';
-        document.documentElement.dataset.theme = next;
-        await Storage.setTheme(next);
-        updateThemeIcon(next);
+    async function handleThemeChange(theme) {
+        document.documentElement.dataset.theme = theme;
+        await Storage.setTheme(theme);
+        updateHljsTheme(theme);
     }
 
-    function updateThemeIcon(theme) {
-        const darkIcon = $('theme-icon-dark');
-        const lightIcon = $('theme-icon-light');
-        if (theme === 'dark') {
-            darkIcon.style.display = '';
-            lightIcon.style.display = 'none';
-        } else {
-            darkIcon.style.display = 'none';
-            lightIcon.style.display = '';
-        }
-        // Switch highlight.js theme
+    function updateHljsTheme(theme) {
         const darkSheet = document.getElementById('hljs-dark-theme');
         const lightSheet = document.getElementById('hljs-light-theme');
         if (darkSheet && lightSheet) {
-            darkSheet.disabled = theme !== 'dark';
-            lightSheet.disabled = theme !== 'light';
+            const isLight = theme === 'light';
+            darkSheet.disabled = isLight;
+            lightSheet.disabled = !isLight;
         }
     }
 
@@ -1170,12 +1154,6 @@ Use the above search results to inform your answer. Cite sources using [number] 
             btn.title = 'Send message';
             btn.onclick = handleSend;
         }
-    }
-
-    function updateTokenCounter() {
-        const text = $('message-input').value;
-        const tokens = Math.ceil(text.length / 3.5);
-        $('token-counter').textContent = `~${tokens} tokens`;
     }
 
     // --- Export ---
