@@ -501,6 +501,57 @@ body {
     color: var(--text-muted);
 }
 
+/* --- Web Search Toggle --- */
+#web-search-btn {
+    position: relative;
+    transition: all 0.2s ease;
+}
+
+#web-search-btn.web-search-active {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border-radius: var(--radius-sm);
+}
+
+#web-search-btn.web-search-active svg {
+    stroke: var(--accent);
+    filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent) 40%, transparent));
+}
+
+/* --- Search Status Indicator --- */
+.search-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    margin: 4px 0;
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
+    border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border-color));
+    border-radius: var(--radius-md);
+    font-size: 12px;
+    color: var(--text-secondary);
+    animation: searchPulse 1.5s ease-in-out infinite;
+}
+
+.search-status.done {
+    animation: none;
+    opacity: 0.7;
+}
+
+.search-status .search-icon {
+    font-size: 14px;
+}
+
+.search-status .search-query {
+    color: var(--accent);
+    font-weight: 500;
+}
+
+@keyframes searchPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
 /* --- Buttons --- */
 .btn {
     display: inline-flex;

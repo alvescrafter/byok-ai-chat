@@ -15,6 +15,7 @@ const App = (() => {
     let screenshotData = null; // attached screenshot data URL
     let attachedFiles = [];     // attached files (images + text)
     let streamPort = null;     // port for streaming communication with service worker
+    let webSearchEnabled = false; // web search toggle state
 
     // --- DOM References ---
     const $ = (id) => document.getElementById(id);
@@ -29,6 +30,10 @@ const App = (() => {
         const theme = await Storage.getTheme();
         document.documentElement.dataset.theme = theme;
         updateThemeIcon(theme);
+
+        // Apply web search toggle from settings
+        webSearchEnabled = settings.webSearchEnabled || false;
+        updateWebSearchButton();
 
         // Populate provider/model dropdowns
         UI.populateProviderSelect($('provider-select'), settings);
@@ -125,6 +130,9 @@ const App = (() => {
         $('attach-file-btn').addEventListener('click', () => $('file-input').click());
         $('file-input').addEventListener('change', handleFileAttach);
 
+        // Web search toggle
+        $('web-search-btn').addEventListener('click', handleWebSearchToggle);
+
         // Conversation rename event
         document.addEventListener('conversation-renamed', (e) => {
             const { id, title } = e.detail;
@@ -155,6 +163,9 @@ const App = (() => {
         document.querySelectorAll('.test-connection-btn').forEach(btn => {
             btn.addEventListener('click', () => handleTestConnection(btn.dataset.provider, btn));
         });
+
+        // Web search test connection
+        $('websearch-test-btn').addEventListener('click', handleWebSearchTest);
     }
 
     // --- Handle Background Messages (from service worker) ---
@@ -252,7 +263,21 @@ const App = (() => {
         const conversation = await Storage.getConversation(currentConversationId);
         const messages = buildApiMessages(conversation);
 
-        // Start streaming
+        // Start streaming (with or without web search)
+        if (webSearchEnabled) {
+            await handleSendWithSearch(conversation, messages);
+        } else {
+            startStreaming(messages);
+        }
+
+        // Generate title if first message
+        if (conversation.messages.length <= 1) {
+            generateTitle(messages);
+        }
+    }
+
+    // --- Start Streaming (normal, no search) ---
+    function startStreaming(messages) {
         isStreaming = true;
         abortController = new AbortController();
         updateSendButton();
@@ -262,8 +287,6 @@ const App = (() => {
         renderAssistantMessage(assistantMsg, true);
 
         // Send to service worker via port-based streaming
-        // chrome.runtime.sendMessage is unreliable for service worker → side panel.
-        // Instead, open a port and send/receive through it.
         streamPort = chrome.runtime.connect({ name: 'ai-stream' });
 
         streamPort.onMessage.addListener((msg) => {
@@ -281,7 +304,6 @@ const App = (() => {
         });
 
         streamPort.onDisconnect.addListener(() => {
-            // Port closed (service worker restarted or panel closed)
             if (isStreaming) {
                 handleStreamError({ error: 'Connection to service worker lost.' });
             }
@@ -296,14 +318,211 @@ const App = (() => {
                 model: $('model-select').value,
                 temperature: settings.defaultTemperature ?? 0.7,
                 topP: settings.defaultTopP ?? 1,
-                abortSignal: null, // can't pass AbortSignal across message boundary
+                abortSignal: null,
             },
             settings,
         });
+    }
 
-        // Generate title if first message
-        if (conversation.messages.length <= 1) {
-            generateTitle(messages);
+    // --- Handle Send with Web Search ---
+    // 3-step pipeline: LLM generates search query → DuckDuckGo search → LLM answers with context
+    async function handleSendWithSearch(conversation, messages) {
+        const userContent = messages[messages.length - 1]?.content || '';
+
+        // Show search status indicator
+        const searchStatusEl = showSearchStatus('Generating search query...');
+
+        try {
+            // Step 1: Ask LLM to generate a search query
+            const queryMessages = [
+                { role: 'system', content: 'You are a search query generator. Given a user message, generate a concise web search query that would find relevant information to answer it. Return ONLY the search query, nothing else. No explanation, no quotes, no prefixes. Just the search terms.' },
+                { role: 'user', content: userContent },
+            ];
+
+            const searchQuery = await generateSearchQuery(queryMessages);
+
+            if (!searchQuery || searchQuery.trim().length === 0) {
+                // Query generation failed — fall back to normal send
+                removeSearchStatus(searchStatusEl);
+                startStreaming(messages);
+                return;
+            }
+
+            // Update status
+            updateSearchStatus(searchStatusEl, `Searching web for: ${searchQuery}`);
+
+            // Step 2: Search DuckDuckGo
+            const searchResults = await performWebSearch(searchQuery);
+
+            if (!searchResults || !searchResults.results || searchResults.results.length === 0) {
+                // No results — fall back to normal send with a note
+                removeSearchStatus(searchStatusEl);
+                UI.toast('No search results found, answering without web context', 'info');
+                startStreaming(messages);
+                return;
+            }
+
+            // Update status to done
+            finalizeSearchStatus(searchStatusEl, searchQuery);
+
+            // Step 3: Build final messages with search context injected
+            const searchContext = WebSearchAPI.buildSearchContext(searchResults);
+            const contextBlock = `[Web Search Results for: "${searchQuery}"]
+${searchContext}
+[/Web Search Results]
+
+Use the above search results to inform your answer. Cite sources using [number] references where applicable. If the search results are not relevant, answer based on your own knowledge.`;
+
+            // Inject search context into the system prompt or as a system message
+            const finalMessages = messages.map(m => ({ ...m }));
+
+            // Find system message and append context, or add a new system message
+            const systemIdx = finalMessages.findIndex(m => m.role === 'system');
+            if (systemIdx >= 0) {
+                finalMessages[systemIdx] = {
+                    ...finalMessages[systemIdx],
+                    content: finalMessages[systemIdx].content + '\n\n' + contextBlock,
+                };
+            } else {
+                finalMessages.unshift({ role: 'system', content: contextBlock });
+            }
+
+            // Start streaming with enriched context
+            startStreaming(finalMessages);
+
+        } catch (err) {
+            // Any error in the search pipeline — fall back to normal send
+            console.error('[WebSearch] Error:', err);
+            removeSearchStatus(searchStatusEl);
+            UI.toast('Web search failed, answering without search', 'error');
+            startStreaming(messages);
+        }
+    }
+
+    // --- Generate Search Query via LLM ---
+    // Sends a short non-streaming request to the LLM to generate a search query.
+    async function generateSearchQuery(messages) {
+        return new Promise((resolve) => {
+            // Use a temporary port for the query generation (non-streaming)
+            const queryPort = chrome.runtime.connect({ name: 'ai-stream' });
+            let fullContent = '';
+
+            queryPort.onMessage.addListener((msg) => {
+                switch (msg.type) {
+                    case 'STREAM_CHUNK':
+                        fullContent = msg.fullContent;
+                        break;
+                    case 'STREAM_DONE':
+                        queryPort.disconnect();
+                        resolve(fullContent.trim());
+                        break;
+                    case 'STREAM_ERROR':
+                        queryPort.disconnect();
+                        resolve('');
+                        break;
+                }
+            });
+
+            queryPort.onDisconnect.addListener(() => {
+                resolve(fullContent.trim() || '');
+            });
+
+            queryPort.postMessage({
+                type: 'SEND_MESSAGE',
+                messages,
+                options: {
+                    provider: $('provider-select').value,
+                    model: $('model-select').value,
+                    temperature: 0.3, // Low temperature for focused query
+                    topP: 1,
+                    maxTokens: 50, // Short response
+                    abortSignal: null,
+                },
+                settings,
+            });
+
+            // Timeout after 10 seconds
+            setTimeout(() => {
+                try { queryPort.disconnect(); } catch {}
+                resolve(fullContent.trim() || '');
+            }, 10000);
+        });
+    }
+
+    // --- Perform Web Search ---
+    async function performWebSearch(query) {
+        return new Promise((resolve) => {
+            chrome.runtime.sendMessage({
+                type: 'WEB_SEARCH',
+                query,
+            }, (response) => {
+                if (response?.success) {
+                    resolve(response.data);
+                } else {
+                    console.error('[WebSearch] Error:', response?.error);
+                    resolve(null);
+                }
+            });
+        });
+    }
+
+    // --- Search Status UI ---
+    function showSearchStatus(text) {
+        const messagesEl = $('messages');
+        const div = document.createElement('div');
+        div.className = 'search-status';
+        div.innerHTML = `<span class="search-icon">🔍</span> <span>${UI.escapeHtml(text)}</span>`;
+        messagesEl.appendChild(div);
+        UI.scrollToBottom($('chat-container'));
+        return div;
+    }
+
+    function updateSearchStatus(el, text) {
+        if (el) {
+            el.innerHTML = `<span class="search-icon">🔍</span> <span>${UI.escapeHtml(text)}</span>`;
+            UI.scrollToBottom($('chat-container'));
+        }
+    }
+
+    function finalizeSearchStatus(el, query) {
+        if (el) {
+            el.className = 'search-status done';
+            el.innerHTML = `<span class="search-icon">🌐</span> Searched DuckDuckGo: <span class="search-query">${UI.escapeHtml(query)}</span>`;
+            UI.scrollToBottom($('chat-container'));
+        }
+    }
+
+    function removeSearchStatus(el) {
+        if (el) el.remove();
+    }
+
+    // --- Web Search Toggle ---
+    function handleWebSearchToggle() {
+        webSearchEnabled = !webSearchEnabled;
+        updateWebSearchButton();
+
+        // Persist to settings
+        settings.webSearchEnabled = webSearchEnabled;
+        Storage.saveSettings(settings);
+        chrome.runtime.sendMessage({ type: 'SAVE_SETTINGS', settings });
+
+        // Persist to conversation
+        if (currentConversationId) {
+            Storage.updateConversation(currentConversationId, { webSearchEnabled });
+        }
+
+        UI.toast(webSearchEnabled ? '🌐 Web search on' : 'Web search off', webSearchEnabled ? 'success' : 'info');
+    }
+
+    function updateWebSearchButton() {
+        const btn = $('web-search-btn');
+        if (!btn) return;
+        if (webSearchEnabled) {
+            btn.classList.add('web-search-active');
+            btn.title = 'Web search is on (click to turn off)';
+        } else {
+            btn.classList.remove('web-search-active');
+            btn.title = 'Toggle web search';
         }
     }
 
@@ -474,6 +693,10 @@ const App = (() => {
         // Set provider/model from conversation
         if (convo.provider) $('provider-select').value = convo.provider;
         if (convo.model) $('model-select').value = convo.model;
+
+        // Restore web search toggle from conversation
+        webSearchEnabled = convo.webSearchEnabled ?? settings.webSearchEnabled ?? false;
+        updateWebSearchButton();
     }
 
     async function loadConversationList() {
@@ -542,48 +765,7 @@ const App = (() => {
                 const conversation = await Storage.getConversation(currentConversationId);
                 const messages = buildApiMessages(conversation);
 
-                isStreaming = true;
-                abortController = new AbortController();
-                updateSendButton();
-
-                const assistantMsg = { id: Storage.generateId(), role: 'assistant', content: '', timestamp: Date.now(), files: [] };
-                renderAssistantMessage(assistantMsg, true);
-
-                // Use port-based streaming for regeneration too
-                streamPort = chrome.runtime.connect({ name: 'ai-stream' });
-
-                streamPort.onMessage.addListener((msg) => {
-                    switch (msg.type) {
-                        case 'STREAM_CHUNK':
-                            handleStreamChunk(msg);
-                            break;
-                        case 'STREAM_DONE':
-                            handleStreamDone(msg);
-                            break;
-                        case 'STREAM_ERROR':
-                            handleStreamError(msg);
-                            break;
-                    }
-                });
-
-                streamPort.onDisconnect.addListener(() => {
-                    if (isStreaming) {
-                        handleStreamError({ error: 'Connection to service worker lost.' });
-                    }
-                    streamPort = null;
-                });
-
-                streamPort.postMessage({
-                    type: 'SEND_MESSAGE',
-                    messages,
-                    options: {
-                        provider: $('provider-select').value,
-                        model: $('model-select').value,
-                        temperature: settings.defaultTemperature ?? 0.7,
-                        topP: settings.defaultTopP ?? 1,
-                    },
-                    settings,
-                });
+                startStreaming(messages);
             }
         }
 
@@ -842,6 +1024,8 @@ const App = (() => {
         $('custom-baseurl').value = p.custom?.baseUrl || '';
         $('custom-apikey').value = p.custom?.apiKey || '';
         $('custom-model').value = p.custom?.model || '';
+
+        // Web search settings — no configuration needed (DuckDuckGo works out of the box)
     }
 
     async function handleSaveSettings() {
@@ -853,6 +1037,7 @@ const App = (() => {
             lmstudio: { apiKey: '', baseUrl: $('lmstudio-baseurl').value || 'http://localhost:1234/v1' },
             custom: { apiKey: $('custom-apikey').value, baseUrl: $('custom-baseurl').value, model: $('custom-model').value },
         };
+
         await Storage.saveSettings(settings);
 
         // Also save to service worker
@@ -1040,6 +1225,33 @@ const App = (() => {
 
     // --- Start ---
     document.addEventListener('DOMContentLoaded', init);
+
+    // --- Web Search Test Connection ---
+    async function handleWebSearchTest() {
+        const btn = $('websearch-test-btn');
+
+        btn.textContent = 'Testing...';
+        btn.className = 'test-connection-btn';
+
+        chrome.runtime.sendMessage({
+            type: 'WEB_SEARCH_TEST',
+        }, (response) => {
+            if (response?.ok) {
+                btn.textContent = '✓ Connected';
+                btn.classList.add('success');
+                UI.toast('DuckDuckGo search connected!', 'success');
+            } else {
+                btn.textContent = '✗ Failed';
+                btn.classList.add('error');
+                UI.toast(response?.error || 'DuckDuckGo connection failed', 'error');
+            }
+
+            setTimeout(() => {
+                btn.textContent = 'Test';
+                btn.className = 'test-connection-btn';
+            }, 3000);
+        });
+    }
 
     return {
         init,

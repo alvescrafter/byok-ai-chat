@@ -6,6 +6,7 @@
 
 // Import API module via importScripts (service worker context)
 importScripts('js/api.js');
+importScripts('js/searx-api.js');
 
 // --- Side Panel Setup ---
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
@@ -65,6 +66,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         case 'SAVE_SETTINGS':
             handleSaveSettings(message, sendResponse);
+            return true; // async
+
+        case 'WEB_SEARCH':
+            handleWebSearch(message, sendResponse);
+            return true; // async
+
+        case 'WEB_SEARCH_TEST':
+            handleWebSearchTest(sendResponse);
             return true; // async
 
         default:
@@ -285,7 +294,29 @@ function getDefaultSettings() {
         defaultTopP: 1,
         contextMode: 'truncate',
         maxContextMessages: 50,
+        webSearchEnabled: false,
     };
+}
+
+// --- Handler: Web Search ---
+async function handleWebSearch(message, sendResponse) {
+    try {
+        const { query } = message;
+        const result = await WebSearchAPI.search(query);
+        sendResponse({ success: true, data: result });
+    } catch (error) {
+        sendResponse({ success: false, error: error.message });
+    }
+}
+
+// --- Handler: Web Search Test ---
+async function handleWebSearchTest(sendResponse) {
+    try {
+        const result = await WebSearchAPI.testConnection();
+        sendResponse(result);
+    } catch (error) {
+        sendResponse({ ok: false, error: error.message });
+    }
 }
 
 

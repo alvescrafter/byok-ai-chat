@@ -234,6 +234,7 @@ const Storage = (() => {
             maxContextMessages: 50,
             enableVoiceInput: false,
             enableTTS: false,
+            webSearchEnabled: false,
         };
     }
 

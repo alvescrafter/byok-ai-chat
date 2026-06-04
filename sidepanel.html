@@ -87,6 +87,9 @@
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                     </button>
                     <input type="file" id="file-input" multiple accept="image/*,.txt,.md,.json,.csv,.py,.js,.html,.css,.xml,.yaml,.yml,.log,.pdf,.doc,.docx" style="display:none">
+                    <button id="web-search-btn" class="btn btn-ghost btn-icon" title="Toggle web search">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                    </button>
                     <button id="screenshot-btn" class="btn btn-ghost btn-icon" title="Capture screenshot">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
                     </button>
@@ -230,6 +233,17 @@
                     </div>
                 </div>
 
+                <!-- Web Search -->
+                <div class="settings-section">
+                    <h4>🌐 Web Search</h4>
+                    <div class="provider-config">
+                        <div class="provider-config-header">
+                            <h5>DuckDuckGo Search</h5>
+                            <button class="test-connection-btn" id="websearch-test-btn">Test</button>
+                        </div>
+                        <p style="font-size:11px; color:var(--text-muted); margin:4px 0 0;">Uses DuckDuckGo for web search. No API key or setup needed. Works directly from your browser.</p>
+                    </div>
+                </div>
 
             </div>
             <div class="modal-footer">
@@ -292,6 +306,7 @@
     <script src="js/markdown.js"></script>
     <script src="js/storage.js"></script>
     <script src="js/ui.js"></script>
+    <script src="js/searx-api.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>
