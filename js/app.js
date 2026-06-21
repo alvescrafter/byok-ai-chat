@@ -320,59 +320,170 @@ const App = (() => {
         });
     }
 
-    // --- Handle Send with Web Search ---
-    // 3-step pipeline: LLM generates search query → DuckDuckGo search → LLM answers with context
+    // --- Handle Send with Web Search (Iterative Multi-Query Protocol) ---
+    // LLM plans search queries → searches one-by-one → LLM reviews results →
+    // decides to search more or answer. Injects current date/time for recency.
     async function handleSendWithSearch(conversation, messages) {
         const userContent = messages[messages.length - 1]?.content || '';
+        const maxSearches = settings.maxSearchRounds || 5;
+        const now = new Date().toLocaleString();
 
-        // Show search status indicator
-        const searchStatusEl = showSearchStatus('Generating search query...');
+        // Container for all stacked search status indicators
+        const statusContainer = showSearchStatusContainer();
 
         try {
-            // Step 1: Ask LLM to generate a search query
-            const queryMessages = [
-                { role: 'system', content: 'You are a search query generator. Given a user message, generate a concise web search query that would find relevant information to answer it. Return ONLY the search query, nothing else. No explanation, no quotes, no prefixes. Just the search terms.' },
+            // === PLANNING STEP ===
+            const planningEl = showPlanningStatus(statusContainer);
+
+            const planningMessages = [
+                {
+                    role: 'system',
+                    content: `You are a research assistant. Given a user's question, generate web search queries to find relevant, current information.
+
+Current date and time: ${now}
+
+Break the question into 1-3 focused search queries if the question is complex or multi-faceted. For simple questions, generate a single query. Use the current date above to make queries time-relevant when appropriate (e.g., add the current year or month for news, recent events, or evolving topics).
+
+Return ONLY the search queries, one per line. No numbering, no explanation, no quotes, no prefixes. Just the search terms.`
+                },
                 { role: 'user', content: userContent },
             ];
 
-            const searchQuery = await generateSearchQuery(queryMessages);
+            const planResponse = await callLLM(planningMessages, { temperature: 0.3, maxTokens: 150, timeout: 15000 });
+            removeSearchStatus(planningEl);
 
-            if (!searchQuery || searchQuery.trim().length === 0) {
-                // Query generation failed — fall back to normal send
-                removeSearchStatus(searchStatusEl);
+            // Parse queries (one per line, strip empty lines and numbering)
+            let queries = planResponse
+                .split('\n')
+                .map(q => q.replace(/^\d+[\.\)]\s*/, '').trim())  // strip "1. " prefixes
+                .filter(q => q.length > 0 && !q.toLowerCase().startsWith('here are') && !q.toLowerCase().startsWith('search queries'));
+
+            if (queries.length === 0) {
+                removeSearchStatusContainer(statusContainer);
                 startStreaming(messages);
                 return;
             }
 
-            // Update status
-            updateSearchStatus(searchStatusEl, `Searching web for: ${searchQuery}`);
+            // Limit initial queries to maxSearches
+            queries = queries.slice(0, maxSearches);
 
-            // Step 2: Search DuckDuckGo
-            const searchResults = await performWebSearch(searchQuery);
+            // === ITERATIVE SEARCH LOOP ===
+            const allResults = [];      // accumulated results from all searches
+            const seenUrls = new Set(); // dedup by URL
+            let searchCount = 0;
 
-            if (!searchResults || !searchResults.results || searchResults.results.length === 0) {
-                // No results — fall back to normal send with a note
-                removeSearchStatus(searchStatusEl);
+            while (queries.length > 0 && searchCount < maxSearches) {
+                const query = queries.shift();
+                searchCount++;
+
+                // Show search status for this query
+                const searchEl = showSearchRoundStatus(statusContainer, query, searchCount, maxSearches);
+
+                // Perform the search
+                const searchResults = await performWebSearch(query);
+
+                if (searchResults && searchResults.results && searchResults.results.length > 0) {
+                    // Deduplicate by URL and accumulate
+                    for (const result of searchResults.results) {
+                        if (result.url && !seenUrls.has(result.url)) {
+                            seenUrls.add(result.url);
+                            allResults.push({ ...result, query });
+                        }
+                    }
+                    finalizeSearchRoundStatus(searchEl, query, searchResults.results.length);
+                } else {
+                    // No results for this query
+                    failSearchRoundStatus(searchEl, query);
+                }
+
+                // === REVIEW STEP (only if we have more searches budget and more queries pending) ===
+                if (searchCount < maxSearches && queries.length === 0 && allResults.length > 0) {
+                    const reviewEl = showReviewStatus(statusContainer);
+
+                    const reviewContext = allResults.map((r, i) => {
+                        return `[${i + 1}] **${r.title}** (${r.source}) [query: "${r.query}"]\n${r.snippet}`;
+                    }).join('\n\n');
+
+                    const reviewMessages = [
+                        {
+                            role: 'system',
+                            content: `You are a research assistant reviewing web search results to answer a user's question.
+
+User's question: ${userContent}
+
+Search results collected so far:
+${reviewContext}
+
+Do you have enough information to answer the question comprehensively and accurately?
+
+- If YES, respond with exactly: ANSWER
+- If NO, respond with one or more lines in the format: SEARCH: <new search query>
+
+Only request more searches if the current results are clearly insufficient. Be efficient — do not search for information you already have. Do not request more than 2 additional searches.`
+                        },
+                        { role: 'user', content: 'Review the results and decide: ANSWER or SEARCH: <query>' },
+                    ];
+
+                    const reviewResponse = await callLLM(reviewMessages, { temperature: 0.2, maxTokens: 200, timeout: 15000 });
+                    removeSearchStatus(reviewEl);
+
+                    // Parse review response
+                    const trimmed = reviewResponse.trim();
+                    if (trimmed.toUpperCase().startsWith('ANSWER')) {
+                        // LLM is satisfied — proceed to final answer
+                        break;
+                    }
+
+                    // Extract SEARCH: queries
+                    const newQueries = trimmed
+                        .split('\n')
+                        .filter(line => line.match(/^SEARCH:\s*/i))
+                        .map(line => line.replace(/^SEARCH:\s*/i, '').trim())
+                        .filter(q => q.length > 0)
+                        .slice(0, 2); // max 2 follow-up queries per review
+
+                    if (newQueries.length === 0) {
+                        // Malformed response — treat as ANSWER
+                        break;
+                    }
+
+                    // Add new queries to the queue (respecting maxSearches)
+                    const remainingBudget = maxSearches - searchCount;
+                    queries.push(...newQueries.slice(0, remainingBudget));
+                }
+            }
+
+            // === FINALIZE ===
+            removeSearchStatusContainer(statusContainer);
+
+            if (allResults.length === 0) {
                 UI.toast('No search results found, answering without web context', 'info');
                 startStreaming(messages);
                 return;
             }
 
-            // Update status to done
-            finalizeSearchStatus(searchStatusEl, searchQuery);
+            if (searchCount >= maxSearches && queries.length > 0) {
+                UI.toast(`Max searches (${maxSearches}) reached, answering with available info`, 'info');
+            }
 
-            // Step 3: Build final messages with search context injected
-            const searchContext = WebSearchAPI.buildSearchContext(searchResults);
-            const contextBlock = `[Web Search Results for: "${searchQuery}"]
+            // Build context block from ALL collected results
+            const searchContext = allResults.map((r, i) => {
+                return `[${i + 1}] **${r.title}** (${r.source})\n${r.snippet}`;
+            }).join('\n\n');
+
+            const queriesUsed = [...new Set(allResults.map(r => r.query))];
+            const contextBlock = `[Web Search Results — ${allResults.length} results from ${queriesUsed.length} search${queriesUsed.length > 1 ? 'es' : ''}]
+Searches performed: ${queriesUsed.join(' | ')}
+
 ${searchContext}
 [/Web Search Results]
 
-Use the above search results to inform your answer. Cite sources using [number] references where applicable. If the search results are not relevant, answer based on your own knowledge.`;
+Current date: ${now}
+
+Use the above search results to inform your answer. Cite sources using [number] references where applicable. If the search results are not relevant to a part of the question, answer that part based on your own knowledge. Prioritize the most recent information when relevant.`;
 
             // Inject search context into the system prompt or as a system message
             const finalMessages = messages.map(m => ({ ...m }));
-
-            // Find system message and append context, or add a new system message
             const systemIdx = finalMessages.findIndex(m => m.role === 'system');
             if (systemIdx >= 0) {
                 finalMessages[systemIdx] = {
@@ -387,61 +498,67 @@ Use the above search results to inform your answer. Cite sources using [number] 
             startStreaming(finalMessages);
 
         } catch (err) {
-            // Any error in the search pipeline — fall back to normal send
             console.error('[WebSearch] Error:', err);
-            removeSearchStatus(searchStatusEl);
+            removeSearchStatusContainer(statusContainer);
             UI.toast('Web search failed, answering without search', 'error');
             startStreaming(messages);
         }
     }
 
-    // --- Generate Search Query via LLM ---
-    // Sends a short non-streaming request to the LLM to generate a search query.
-    async function generateSearchQuery(messages) {
-        return new Promise((resolve) => {
-            // Use a temporary port for the query generation (non-streaming)
-            const queryPort = chrome.runtime.connect({ name: 'ai-stream' });
-            let fullContent = '';
+    // --- Generic Non-Streaming LLM Call ---
+    // Reusable helper: sends messages to the LLM via a temporary port, collects
+    // the full response, and resolves. Used for planning, review, and follow-up
+    // query generation in the iterative search protocol.
+    async function callLLM(messages, opts = {}) {
+        const temperature = opts.temperature ?? 0.3;
+        const maxTokens = opts.maxTokens ?? 100;
+        const timeout = opts.timeout ?? 15000;
 
-            queryPort.onMessage.addListener((msg) => {
+        return new Promise((resolve) => {
+            const port = chrome.runtime.connect({ name: 'ai-stream' });
+            let fullContent = '';
+            let settled = false;
+
+            const finish = (value) => {
+                if (settled) return;
+                settled = true;
+                try { port.disconnect(); } catch {}
+                resolve(value);
+            };
+
+            port.onMessage.addListener((msg) => {
                 switch (msg.type) {
                     case 'STREAM_CHUNK':
                         fullContent = msg.fullContent;
                         break;
                     case 'STREAM_DONE':
-                        queryPort.disconnect();
-                        resolve(fullContent.trim());
+                        finish(fullContent.trim());
                         break;
                     case 'STREAM_ERROR':
-                        queryPort.disconnect();
-                        resolve('');
+                        finish('');
                         break;
                 }
             });
 
-            queryPort.onDisconnect.addListener(() => {
-                resolve(fullContent.trim() || '');
+            port.onDisconnect.addListener(() => {
+                finish(fullContent.trim() || '');
             });
 
-            queryPort.postMessage({
+            port.postMessage({
                 type: 'SEND_MESSAGE',
                 messages,
                 options: {
                     provider: $('provider-select').value,
                     model: $('model-select').value,
-                    temperature: 0.3, // Low temperature for focused query
+                    temperature,
                     topP: 1,
-                    maxTokens: 50, // Short response
+                    maxTokens,
                     abortSignal: null,
                 },
                 settings,
             });
 
-            // Timeout after 10 seconds
-            setTimeout(() => {
-                try { queryPort.disconnect(); } catch {}
-                resolve(fullContent.trim() || '');
-            }, 10000);
+            setTimeout(() => finish(fullContent.trim() || ''), timeout);
         });
     }
 
@@ -462,34 +579,65 @@ Use the above search results to inform your answer. Cite sources using [number] 
         });
     }
 
-    // --- Search Status UI ---
-    function showSearchStatus(text) {
+    // --- Search Status UI (Stacked Indicators) ---
+    function showSearchStatusContainer() {
         const messagesEl = $('messages');
+        const container = document.createElement('div');
+        container.className = 'search-status-container';
+        messagesEl.appendChild(container);
+        UI.scrollToBottom($('chat-container'));
+        return container;
+    }
+
+    function showPlanningStatus(container) {
         const div = document.createElement('div');
-        div.className = 'search-status';
-        div.innerHTML = `<span class="search-icon">🔍</span> <span>${UI.escapeHtml(text)}</span>`;
-        messagesEl.appendChild(div);
+        div.className = 'search-status planning';
+        div.innerHTML = `<span class="search-icon">🧠</span> <span>Planning search queries...</span>`;
+        container.appendChild(div);
         UI.scrollToBottom($('chat-container'));
         return div;
     }
 
-    function updateSearchStatus(el, text) {
+    function showSearchRoundStatus(container, query, roundNum, maxRounds) {
+        const div = document.createElement('div');
+        div.className = 'search-status';
+        div.innerHTML = `<span class="search-round-badge">${roundNum}/${maxRounds}</span> <span class="search-icon">🔍</span> <span>Searching: <span class="search-query">${UI.escapeHtml(query)}</span></span>`;
+        container.appendChild(div);
+        UI.scrollToBottom($('chat-container'));
+        return div;
+    }
+
+    function finalizeSearchRoundStatus(el, query, resultCount) {
         if (el) {
-            el.innerHTML = `<span class="search-icon">🔍</span> <span>${UI.escapeHtml(text)}</span>`;
+            el.className = 'search-status done';
+            el.innerHTML = `<span class="search-round-badge done">✓</span> <span class="search-icon">🌐</span> <span>Found ${resultCount} result${resultCount !== 1 ? 's' : ''}: <span class="search-query">${UI.escapeHtml(query)}</span></span>`;
             UI.scrollToBottom($('chat-container'));
         }
     }
 
-    function finalizeSearchStatus(el, query) {
+    function failSearchRoundStatus(el, query) {
         if (el) {
             el.className = 'search-status done';
-            el.innerHTML = `<span class="search-icon">🌐</span> Searched DuckDuckGo: <span class="search-query">${UI.escapeHtml(query)}</span>`;
+            el.innerHTML = `<span class="search-round-badge failed">✗</span> <span class="search-icon">🔍</span> <span>No results: <span class="search-query">${UI.escapeHtml(query)}</span></span>`;
             UI.scrollToBottom($('chat-container'));
         }
+    }
+
+    function showReviewStatus(container) {
+        const div = document.createElement('div');
+        div.className = 'search-status reviewing';
+        div.innerHTML = `<span class="search-icon">📋</span> <span>Reviewing results...</span>`;
+        container.appendChild(div);
+        UI.scrollToBottom($('chat-container'));
+        return div;
     }
 
     function removeSearchStatus(el) {
         if (el) el.remove();
+    }
+
+    function removeSearchStatusContainer(container) {
+        if (container) container.remove();
     }
 
     // --- Web Search Toggle ---
@@ -1020,7 +1168,8 @@ Use the above search results to inform your answer. Cite sources using [number] 
         $('custom-apikey').value = p.custom?.apiKey || '';
         $('custom-model').value = p.custom?.model || '';
 
-        // Web search settings — no configuration needed (DuckDuckGo works out of the box)
+        // Web search settings
+        $('max-search-rounds').value = settings.maxSearchRounds || 5;
     }
 
     async function handleSaveSettings() {
@@ -1032,6 +1181,9 @@ Use the above search results to inform your answer. Cite sources using [number] 
             lmstudio: { apiKey: '', baseUrl: $('lmstudio-baseurl').value || 'http://localhost:1234/v1' },
             custom: { apiKey: $('custom-apikey').value, baseUrl: $('custom-baseurl').value, model: $('custom-model').value },
         };
+
+        // Web search settings
+        settings.maxSearchRounds = parseInt($('max-search-rounds').value, 10) || 5;
 
         await Storage.saveSettings(settings);
 

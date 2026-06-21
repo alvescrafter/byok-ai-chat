@@ -245,6 +245,13 @@
                         </div>
                         <p style="font-size:11px; color:var(--text-muted); margin:4px 0 0;">Uses DuckDuckGo for web search. No API key or setup needed. Works directly from your browser.</p>
                     </div>
+                    <div class="provider-config" style="margin-top:12px;">
+                        <label for="max-search-rounds" style="font-size:12px; font-weight:500; display:block; margin-bottom:4px;">Max web searches per message</label>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <input type="number" id="max-search-rounds" min="1" max="10" value="5" style="width:60px; padding:4px 6px; font-size:13px; background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-sm); color:var(--text-primary);" />
+                            <span style="font-size:11px; color:var(--text-muted);">Higher = more thorough research, but more API calls and slower responses. Each search round uses 1 LLM call + 1 DuckDuckGo search.</span>
+                        </div>
+                    </div>
                 </div>
 
             </div>

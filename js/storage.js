@@ -235,6 +235,7 @@ const Storage = (() => {
             enableVoiceInput: false,
             enableTTS: false,
             webSearchEnabled: false,
+            maxSearchRounds: 5,
         };
     }
 
