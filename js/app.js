@@ -765,7 +765,6 @@ Use the above search results to inform your answer. Cite sources using [number] 
         const el = $('custom-search-count');
         if (el) el.textContent = `(${settings.maxSearchRounds || 5})`;
     }
-    }
 
     // --- Stream Handling ---
     let streamingMessageId = null;
