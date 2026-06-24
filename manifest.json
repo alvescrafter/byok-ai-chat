@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BYOK AI Chat",
-  "version": "1.2.0",
+  "version": "3.1.0",
   "description": "BYOK AI chat in your side panel. OpenAI, Anthropic, Google, Ollama, LM Studio, or custom APIs. Streaming, screenshots, page context.",
   "permissions": [
     "sidePanel",
