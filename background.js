@@ -295,6 +295,7 @@ function getDefaultSettings() {
         contextMode: 'truncate',
         maxContextMessages: 50,
         webSearchEnabled: false,
+        webSearchMode: 'off',
     };
 }
 

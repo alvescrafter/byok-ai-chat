@@ -15,10 +15,29 @@ const App = (() => {
     let screenshotData = null; // attached screenshot data URL
     let attachedFiles = [];     // attached files (images + text)
     let streamPort = null;     // port for streaming communication with service worker
-    let webSearchEnabled = false; // web search toggle state
+    let webSearchMode = 'off'; // web search mode: 'off', 'quick', 'medium', 'deep', 'custom'
 
     // --- DOM References ---
     const $ = (id) => document.getElementById(id);
+
+    // --- Web Search Helpers ---
+    const SEARCH_MODE_NAMES = {
+        off: 'Off',
+        quick: 'Quick Search',
+        medium: 'Medium Search',
+        deep: 'Deep Search',
+        custom: 'Custom Search',
+    };
+
+    function getMaxSearches(mode) {
+        switch (mode) {
+            case 'quick':  return 2;
+            case 'medium': return 5;
+            case 'deep':   return 10;
+            case 'custom': return settings.maxSearchRounds || 5;
+            default:       return 0;
+        }
+    }
 
     // --- Initialization ---
     async function init() {
@@ -32,9 +51,11 @@ const App = (() => {
         $('theme-select').value = theme;
         updateHljsTheme(theme);
 
-        // Apply web search toggle from settings
-        webSearchEnabled = settings.webSearchEnabled || false;
+        // Apply web search mode from settings (backward compat: webSearchEnabled true → 'custom')
+        webSearchMode = settings.webSearchMode || (settings.webSearchEnabled ? 'custom' : 'off');
         updateWebSearchButton();
+        updateWebSearchMenuActive();
+        updateCustomSearchCount();
 
         // Populate provider/model dropdowns
         UI.populateProviderSelect($('provider-select'), settings);
@@ -127,8 +148,10 @@ const App = (() => {
         $('attach-file-btn').addEventListener('click', () => $('file-input').click());
         $('file-input').addEventListener('change', handleFileAttach);
 
-        // Web search toggle
-        $('web-search-btn').addEventListener('click', handleWebSearchToggle);
+        // Web search dropdown
+        $('web-search-btn').addEventListener('click', handleWebSearchButtonClick);
+        $('web-search-menu').addEventListener('click', handleWebSearchMenuClick);
+        document.addEventListener('click', handleWebSearchOutsideClick);
 
         // Conversation rename event
         document.addEventListener('conversation-renamed', (e) => {
@@ -260,7 +283,7 @@ const App = (() => {
         const messages = buildApiMessages(conversation);
 
         // Start streaming (with or without web search)
-        if (webSearchEnabled) {
+        if (webSearchMode !== 'off') {
             await handleSendWithSearch(conversation, messages);
         } else {
             startStreaming(messages);
@@ -325,7 +348,7 @@ const App = (() => {
     // decides to search more or answer. Injects current date/time for recency.
     async function handleSendWithSearch(conversation, messages) {
         const userContent = messages[messages.length - 1]?.content || '';
-        const maxSearches = settings.maxSearchRounds || 5;
+        const maxSearches = getMaxSearches(webSearchMode);
         const now = new Date().toLocaleString();
 
         // Container for all stacked search status indicators
@@ -640,34 +663,108 @@ Use the above search results to inform your answer. Cite sources using [number] 
         if (container) container.remove();
     }
 
-    // --- Web Search Toggle ---
-    function handleWebSearchToggle() {
-        webSearchEnabled = !webSearchEnabled;
+    // --- Web Search Dropdown ---
+    function handleWebSearchButtonClick(e) {
+        e.stopPropagation();
+        if (webSearchMode !== 'off') {
+            // Search is active — clicking the button turns it off directly
+            setWebSearchMode('off');
+        } else {
+            // Search is off — open the dropdown menu
+            toggleWebSearchMenu();
+        }
+    }
+
+    function handleWebSearchMenuClick(e) {
+        const item = e.target.closest('.web-search-dropdown-item');
+        if (!item) return;
+        e.stopPropagation();
+        const { mode } = item.dataset;
+        setWebSearchMode(mode);
+        hideWebSearchMenu();
+    }
+
+    function handleWebSearchOutsideClick(e) {
+        const wrapper = document.querySelector('.web-search-wrapper');
+        const menu = $('web-search-menu');
+        if (menu && menu.style.display !== 'none' && wrapper && !wrapper.contains(e.target)) {
+            hideWebSearchMenu();
+        }
+    }
+
+    function setWebSearchMode(mode) {
+        webSearchMode = mode;
         updateWebSearchButton();
+        updateWebSearchMenuActive();
 
         // Persist to settings
-        settings.webSearchEnabled = webSearchEnabled;
+        settings.webSearchMode = webSearchMode;
+        settings.webSearchEnabled = (webSearchMode !== 'off'); // backward compat
         Storage.saveSettings(settings);
         chrome.runtime.sendMessage({ type: 'SAVE_SETTINGS', settings });
 
         // Persist to conversation
         if (currentConversationId) {
-            Storage.updateConversation(currentConversationId, { webSearchEnabled });
+            Storage.updateConversation(currentConversationId, {
+                webSearchMode,
+                webSearchEnabled: webSearchMode !== 'off',
+            });
         }
 
-        UI.toast(webSearchEnabled ? '🌐 Web search on' : 'Web search off', webSearchEnabled ? 'success' : 'info');
+        if (mode === 'off') {
+            UI.toast('Web search off', 'info');
+        } else {
+            const count = getMaxSearches(mode);
+            UI.toast(`🌐 ${SEARCH_MODE_NAMES[mode]} on (${count} searches)`, 'success');
+        }
+    }
+
+    function toggleWebSearchMenu() {
+        const menu = $('web-search-menu');
+        if (!menu) return;
+        if (menu.style.display === 'none') {
+            updateWebSearchMenuActive();
+            updateCustomSearchCount();
+            menu.style.display = 'flex';
+        } else {
+            menu.style.display = 'none';
+        }
+    }
+
+    function hideWebSearchMenu() {
+        const menu = $('web-search-menu');
+        if (menu) menu.style.display = 'none';
     }
 
     function updateWebSearchButton() {
         const btn = $('web-search-btn');
         if (!btn) return;
-        if (webSearchEnabled) {
+        if (webSearchMode !== 'off') {
             btn.classList.add('web-search-active');
-            btn.title = 'Web search is on (click to turn off)';
+            const count = getMaxSearches(webSearchMode);
+            btn.title = `${SEARCH_MODE_NAMES[webSearchMode]} (${count} searches) — click to turn off`;
         } else {
             btn.classList.remove('web-search-active');
             btn.title = 'Toggle web search';
         }
+    }
+
+    function updateWebSearchMenuActive() {
+        const menu = $('web-search-menu');
+        if (!menu) return;
+        menu.querySelectorAll('.web-search-dropdown-item').forEach(item => {
+            if (item.dataset.mode === webSearchMode) {
+                item.classList.add('active');
+            } else {
+                item.classList.remove('active');
+            }
+        });
+    }
+
+    function updateCustomSearchCount() {
+        const el = $('custom-search-count');
+        if (el) el.textContent = `(${settings.maxSearchRounds || 5})`;
+    }
     }
 
     // --- Stream Handling ---
@@ -838,9 +935,10 @@ Use the above search results to inform your answer. Cite sources using [number] 
         if (convo.provider) $('provider-select').value = convo.provider;
         if (convo.model) $('model-select').value = convo.model;
 
-        // Restore web search toggle from conversation
-        webSearchEnabled = convo.webSearchEnabled ?? settings.webSearchEnabled ?? false;
+        // Restore web search mode from conversation (backward compat: webSearchEnabled true → 'custom')
+        webSearchMode = convo.webSearchMode ?? (convo.webSearchEnabled ? 'custom' : null) ?? settings.webSearchMode ?? 'off';
         updateWebSearchButton();
+        updateWebSearchMenuActive();
     }
 
     async function loadConversationList() {
@@ -1170,6 +1268,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
 
         // Web search settings
         $('max-search-rounds').value = settings.maxSearchRounds || 5;
+        updateCustomSearchCount();
     }
 
     async function handleSaveSettings() {
@@ -1184,6 +1283,9 @@ Use the above search results to inform your answer. Cite sources using [number] 
 
         // Web search settings
         settings.maxSearchRounds = parseInt($('max-search-rounds').value, 10) || 5;
+        updateCustomSearchCount();
+        // If currently in custom mode, refresh button tooltip with new count
+        if (webSearchMode === 'custom') updateWebSearchButton();
 
         await Storage.saveSettings(settings);
 
