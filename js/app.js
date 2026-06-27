@@ -375,16 +375,37 @@ Return ONLY the search queries, one per line. No numbering, no explanation, no q
             const planResponse = await callLLM(planningMessages, { temperature: 0.3, maxTokens: 150, timeout: 15000 });
             removeSearchStatus(planningEl);
 
-            // Parse queries (one per line, strip empty lines and numbering)
+            // Parse queries (one per line, strip numbering, preamble, markdown)
             let queries = planResponse
                 .split('\n')
                 .map(q => q.replace(/^\d+[\.\)]\s*/, '').trim())  // strip "1. " prefixes
-                .filter(q => q.length > 0 && !q.toLowerCase().startsWith('here are') && !q.toLowerCase().startsWith('search queries'));
+                .map(q => q.replace(/^[`*#>]+\s*/, '').trim())       // strip markdown prefixes
+                .filter(q => q.length > 0)
+                .filter(q => !q.startsWith('```'))                     // strip code fence lines
+                .filter(q => {
+                    const lower = q.toLowerCase();
+                    // Strip common LLM preamble lines
+                    return !lower.startsWith('here are') &&
+                           !lower.startsWith('search queries') &&
+                           !lower.startsWith("i'll ") &&
+                           !lower.startsWith('i will ') &&
+                           !lower.startsWith('let me ') &&
+                           !lower.startsWith('sure') &&
+                           !lower.startsWith('okay') &&
+                           !lower.startsWith('of course') &&
+                           !lower.startsWith('certainly') &&
+                           !lower.startsWith('to answer') &&
+                           !lower.startsWith('based on') &&
+                           !lower.startsWith('these are') &&
+                           !lower.startsWith('the following') &&
+                           !lower.startsWith('i need') &&
+                           !lower.startsWith('i should');
+                });
 
             if (queries.length === 0) {
-                removeSearchStatusContainer(statusContainer);
-                startStreaming(messages);
-                return;
+                // Fallback: use the raw user question as a single search query
+                console.log('[WebSearch] No queries parsed from LLM response, using user question as fallback');
+                queries = [userContent.slice(0, 200)];
             }
 
             // Limit initial queries to maxSearches
@@ -586,16 +607,38 @@ Use the above search results to inform your answer. Cite sources using [number] 
     }
 
     // --- Perform Web Search ---
+    // Sends search request to the service worker with a 15s timeout.
+    // Resolves with { results, query, provider } on success, or null on failure.
+    // Errors are logged and surfaced to the caller (not silently swallowed).
     async function performWebSearch(query) {
         return new Promise((resolve) => {
+            let settled = false;
+            const timeoutId = setTimeout(() => {
+                if (!settled) {
+                    settled = true;
+                    console.error('[WebSearch] Timeout for query:', query);
+                    resolve(null);
+                }
+            }, 15000);
+
             chrome.runtime.sendMessage({
                 type: 'WEB_SEARCH',
                 query,
             }, (response) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeoutId);
+
+                if (chrome.runtime.lastError) {
+                    console.error('[WebSearch] Runtime error:', chrome.runtime.lastError.message);
+                    resolve(null);
+                    return;
+                }
+
                 if (response?.success) {
                     resolve(response.data);
                 } else {
-                    console.error('[WebSearch] Error:', response?.error);
+                    console.error('[WebSearch] Error:', response?.error || 'Unknown error');
                     resolve(null);
                 }
             });
@@ -1470,11 +1513,12 @@ Use the above search results to inform your answer. Cite sources using [number] 
             if (response?.ok) {
                 btn.textContent = '✓ Connected';
                 btn.classList.add('success');
-                UI.toast('DuckDuckGo search connected!', 'success');
+                const instance = response.instance ? ` (${response.instance})` : '';
+                UI.toast(`SearXNG search connected${instance} — ${response.results} results`, 'success');
             } else {
                 btn.textContent = '✗ Failed';
                 btn.classList.add('error');
-                UI.toast(response?.error || 'DuckDuckGo connection failed', 'error');
+                UI.toast(response?.error || 'SearXNG connection failed', 'error');
             }
 
             setTimeout(() => {

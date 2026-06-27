@@ -91,7 +91,7 @@
                     </button>
                     <input type="file" id="file-input" multiple accept="image/*,.txt,.md,.json,.csv,.py,.js,.html,.css,.xml,.yaml,.yml,.log,.pdf,.doc,.docx" style="display:none">
                     <div class="web-search-wrapper">
-                        <button id="web-search-btn" class="btn btn-ghost btn-icon" title="Toggle web search">
+                        <button id="web-search-btn" class="btn btn-ghost btn-icon" title="Toggle SearXNG web search">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
                         </button>
                         <div id="web-search-menu" class="web-search-dropdown" style="display:none;">
@@ -249,17 +249,22 @@
                     <h4>🌐 Web Search</h4>
                     <div class="provider-config">
                         <div class="provider-config-header">
-                            <h5>DuckDuckGo Search</h5>
+                            <h5>SearXNG Search</h5>
                             <button class="test-connection-btn" id="websearch-test-btn">Test</button>
                         </div>
-                        <p style="font-size:11px; color:var(--text-muted); margin:4px 0 0;">Uses DuckDuckGo for web search. No API key or setup needed. Works directly from your browser.</p>
+                        <p style="font-size:11px; color:var(--text-muted); margin:4px 0 0;">Tests connectivity to SearXNG public instances. No API key or setup needed — works directly from your browser.</p>
                     </div>
                     <div class="provider-config" style="margin-top:12px;">
-                        <label for="max-search-rounds" style="font-size:12px; font-weight:500; display:block; margin-bottom:4px;">Max web searches per message</label>
+                        <label for="max-search-rounds" style="font-size:12px; font-weight:500; display:block; margin-bottom:4px;">Custom Search — number of searches</label>
                         <div style="display:flex; align-items:center; gap:8px;">
                             <input type="number" id="max-search-rounds" min="1" max="10" value="5" style="width:60px; padding:4px 6px; font-size:13px; background:var(--bg-secondary); border:1px solid var(--border-color); border-radius:var(--radius-sm); color:var(--text-primary);" />
-                            <span style="font-size:11px; color:var(--text-muted);">Higher = more thorough research, but more API calls and slower responses. Each search round uses 1 LLM call + 1 DuckDuckGo search.</span>
+                            <span style="font-size:11px; color:var(--text-muted);">Sets how many SearXNG searches the “Custom Search” mode runs per message (1–10). Higher = more thorough research, but more API calls and slower responses.</span>
                         </div>
+                    </div>
+                    <div class="provider-config" style="margin-top:12px; padding:8px 10px; background:var(--bg-secondary); border-radius:var(--radius-sm); border:1px solid var(--border-color);">
+                        <p style="font-size:11px; color:var(--text-muted); margin:0; line-height:1.5;">
+                            <strong style="color:var(--text-primary);">How it works:</strong> When web search is on (globe icon), the AI plans search queries, looks them up via SearXNG, reviews the results, then answers with live context and source citations. Choose a mode from the globe dropdown: <strong>Quick</strong> (2 searches), <strong>Medium</strong> (5), <strong>Deep</strong> (10), or <strong>Custom</strong> (set the number above). No API key needed — SearXNG is a free, privacy-focused meta-search engine.
+                        </p>
                     </div>
                 </div>
 

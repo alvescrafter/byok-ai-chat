@@ -1,180 +1,127 @@
 /**
  * BYOK AI Chat - Web Search API Module
- * Handles web search via DuckDuckGo HTML scraping.
+ * Handles web search via SearXNG public instances (JSON API).
  * No API key needed. Designed to run in the service worker context.
+ *
+ * SearXNG is a privacy-focused meta-search engine that aggregates results
+ * from Google, Bing, DuckDuckGo, Wikipedia, and more. Public instances
+ * handle bot-detection server-side, so we get clean JSON results without
+ * CAPTCHAs. The file is named searx-api.js because it was always intended
+ * to use SearXNG — the previous DuckDuckGo HTML scraping approach broke
+ * when DDG started serving CAPTCHA challenge pages to all automated requests.
  */
 
 const WebSearchAPI = {
+    // SearXNG public instances that support JSON output (format=json).
+    // These are tried in order — if one fails, the next is attempted.
+    // Verified working as of 2026-06-27. Public instances can go offline,
+    // so we maintain multiple for redundancy.
+    _instances: [
+        'https://search.mdosch.de',
+        'https://searx.linxx.net',
+        'https://search.wdpserver.com',
+        'https://search.url4irl.com',
+    ],
+
     // --- Search ---
-    // Searches DuckDuckGo and returns formatted results.
+    // Queries SearXNG instances and returns formatted results.
     async search(query) {
         if (!query) {
             throw new Error('Query is required');
         }
 
-        // Try DuckDuckGo HTML endpoints
-        const urls = [
-            `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
-            `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`,
-        ];
+        const encodedQuery = encodeURIComponent(query);
 
-        for (const url of urls) {
+        for (const baseUrl of this._instances) {
             try {
+                const url = `${baseUrl}/search?q=${encodedQuery}&format=json`;
+
                 const response = await fetch(url, {
                     signal: AbortSignal.timeout(12000),
-                    headers: {
-                        'Accept': 'text/html,application/xhtml+xml',
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                    },
+                    // No custom headers — adding Accept: application/json triggers a CORS
+                    // preflight (OPTIONS) request, which many SearXNG instances don't
+                    // handle properly. The format=json URL parameter already tells
+                    // SearXNG to return JSON.
                 });
 
                 if (!response.ok) {
-                    console.log(`[WebSearch] DDG ${url} returned HTTP ${response.status}`);
+                    console.log(`[WebSearch] ${baseUrl} returned HTTP ${response.status}`);
                     continue;
                 }
 
-                const html = await response.text();
-
-                // Skip if it's a challenge/captcha page
-                if (html.includes('challenge-form') || html.includes('anomaly-modal')) {
-                    console.log(`[WebSearch] DDG ${url} returned challenge page, skipping`);
+                // Read as text first, then parse as JSON. We can't rely on the
+                // content-type header — many SearXNG instances return "text/html"
+                // even when serving valid JSON with format=json.
+                const text = await response.text();
+                let data;
+                try {
+                    data = JSON.parse(text);
+                } catch (parseErr) {
+                    console.log(`[WebSearch] ${baseUrl} returned non-JSON response (len=${text.length})`);
                     continue;
                 }
 
-                const result = this._parseDuckDuckGoHtml(html, query);
-                if (result.results.length > 0) {
-                    result.provider = 'duckduckgo';
-                    return result;
+                // SearXNG JSON format: { query, results: [...], answers: [...], ... }
+                if (data && Array.isArray(data.results) && data.results.length > 0) {
+                    const results = this._parseSearXngResults(data.results);
+                    if (results.length > 0) {
+                        console.log(`[WebSearch] ${baseUrl} returned ${results.length} results`);
+                        return { results, query, provider: 'searxng', instance: baseUrl };
+                    }
                 }
+
+                console.log(`[WebSearch] ${baseUrl} returned 0 parseable results`);
             } catch (err) {
-                console.log(`[WebSearch] DDG ${url} failed: ${err.message}`);
+                // Log the full error type and message for diagnostics
+                const errType = err.name || 'Error';
+                console.log(`[WebSearch] ${baseUrl} failed: [${errType}] ${err.message}`);
             }
         }
 
-        // Try via CORS proxy as last resort
-        try {
-            const proxyUrl = 'https://corsproxy.io/?' + encodeURIComponent(urls[0]);
-            const proxyResponse = await fetch(proxyUrl, {
-                signal: AbortSignal.timeout(12000),
-                headers: { 'Accept': 'text/html' },
-            });
-
-            if (!proxyResponse.ok) {
-                throw new Error(`DuckDuckGo proxy HTTP ${proxyResponse.status}`);
-            }
-
-            const html = await proxyResponse.text();
-            if (!html.includes('challenge-form') && !html.includes('anomaly-modal')) {
-                const result = this._parseDuckDuckGoHtml(html, query);
-                if (result.results.length > 0) {
-                    result.provider = 'duckduckgo';
-                    return result;
-                }
-            }
-        } catch (proxyErr) {
-            console.log(`[WebSearch] DDG CORS proxy failed: ${proxyErr.message}`);
-        }
-
-        // Everything failed
+        // All instances failed
+        console.log('[WebSearch] All SearXNG instances failed');
         return { results: [], query, provider: 'none' };
     },
 
-    // --- Parse DuckDuckGo HTML Results ---
-    // Handles both html.duckduckgo.com (result__a, result__snippet, result__url__domain)
-    // and lite.duckduckgo.com (result-link, result-snippet) formats.
-    _parseDuckDuckGoHtml(html, query) {
+    // --- Parse SearXNG JSON Results ---
+    // Converts SearXNG result objects to our internal format.
+    // SearXNG fields: url, title, content (snippet), engine, engines (array)
+    _parseSearXngResults(rawResults) {
         const results = [];
+        const seenUrls = new Set();
 
-        // Try html.duckduckgo.com format first (class="result__a")
-        if (html.includes('result__a')) {
-            const resultRegex = /class="result__body"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
-            let match;
+        for (const r of rawResults) {
+            if (!r.url || !r.title) continue;
+            if (seenUrls.has(r.url)) continue;
+            seenUrls.add(r.url);
 
-            while ((match = resultRegex.exec(html)) !== null && results.length < 8) {
-                const block = match[1];
+            // Extract source hostname from URL
+            let source = 'Unknown';
+            try {
+                source = new URL(r.url).hostname.replace(/^www\./, '');
+            } catch {}
 
-                const titleMatch = block.match(/class="result__a"[^>]*>([\s\S]*?)<\/a>/i);
-                const title = titleMatch ? this._decodeHtml(titleMatch[1].trim()) : '';
+            // Use the engine field if available, otherwise use source
+            const engine = r.engine || (r.engines && r.engines[0]) || source;
 
-                const urlMatch = block.match(/class="result__a"[^>]*href="([^"]+)"/i);
-                let url = urlMatch ? urlMatch[1] : '';
+            results.push({
+                title: this._cleanText(r.title),
+                url: r.url,
+                snippet: this._cleanText(r.content || ''),
+                source,
+                engine,
+            });
 
-                if (url.includes('uddg=')) {
-                    try { const uddg = url.match(/uddg=([^&]+)/); if (uddg) url = decodeURIComponent(uddg[1]); } catch {}
-                } else if (url.startsWith('//')) {
-                    url = 'https:' + url;
-                } else if (url.startsWith('/')) {
-                    continue;
-                }
-
-                const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i);
-                const snippet = snippetMatch ? this._decodeHtml(snippetMatch[1].trim()) : '';
-
-                const sourceMatch = block.match(/class="result__url__domain"[^>]*>([\s\S]*?)<\/(?:a|span)>/i);
-                let source = 'Unknown';
-                if (sourceMatch) { source = this._decodeHtml(sourceMatch[1].trim()); }
-                else { try { source = new URL(url).hostname.replace(/^www\./, ''); } catch {} }
-
-                if (title && url && !url.startsWith('/')) {
-                    results.push({ title, url, snippet, source, engine: 'duckduckgo' });
-                }
-            }
-
-            // Simpler fallback regex for html version
-            if (results.length === 0) {
-                const simpleRegex = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-                let simpleMatch;
-                while ((simpleMatch = simpleRegex.exec(html)) !== null && results.length < 8) {
-                    let url = simpleMatch[1];
-                    const title = this._decodeHtml(simpleMatch[2].trim());
-                    if (url.includes('uddg=')) {
-                        try { const uddg = url.match(/uddg=([^&]+)/); if (uddg) url = decodeURIComponent(uddg[1]); } catch {}
-                    }
-                    if (url.startsWith('/')) continue;
-                    let source = 'Unknown';
-                    try { source = new URL(url).hostname.replace(/^www\./, ''); } catch {}
-                    if (title && url) { results.push({ title, url, snippet: '', source, engine: 'duckduckgo' }); }
-                }
-            }
+            if (results.length >= 10) break;
         }
 
-        // Try lite.duckduckgo.com format (class='result-link', class='result-snippet')
-        if (results.length === 0 && html.includes('result-link')) {
-            const linkRegex = /class='result-link'[^>]*href='([^']+)'[^>]*>([\s\S]*?)<\/a>/gi;
-            let linkMatch;
-
-            while ((linkMatch = linkRegex.exec(html)) !== null && results.length < 8) {
-                let url = linkMatch[1];
-                const title = this._decodeHtml(linkMatch[2].trim());
-
-                if (url.includes('uddg=')) {
-                    try { const uddg = url.match(/uddg=([^&]+)/); if (uddg) url = decodeURIComponent(uddg[1]); } catch {}
-                } else if (url.startsWith('//')) {
-                    url = 'https:' + url;
-                } else if (url.startsWith('/')) {
-                    continue;
-                }
-
-                let source = 'Unknown';
-                try { source = new URL(url).hostname.replace(/^www\./, ''); } catch {}
-
-                const snippetBaseIdx = linkMatch.index;
-                const afterSnippet = html.substring(snippetBaseIdx, snippetBaseIdx + 2000);
-                const snippetMatch = afterSnippet.match(/class='result-snippet'[^>]*>([\s\S]*?)<\/a>/i);
-                const snippet = snippetMatch ? this._decodeHtml(snippetMatch[1].trim()) : '';
-
-                if (title && url) {
-                    results.push({ title, url, snippet, source, engine: 'duckduckgo' });
-                }
-            }
-        }
-
-        return { results, query };
+        return results;
     },
 
-    // --- Decode HTML entities ---
-    _decodeHtml(text) {
-        return text
+    // --- Clean text (strip HTML tags, decode entities) ---
+    _cleanText(text) {
+        if (!text) return '';
+        return String(text)
             .replace(/&amp;/g, '&')
             .replace(/&lt;/g, '<')
             .replace(/&gt;/g, '>')
@@ -186,30 +133,42 @@ const WebSearchAPI = {
     },
 
     // --- Test Connection ---
-    // Tests if DuckDuckGo search is reachable.
+    // Tests if any SearXNG instance is reachable and returns parseable JSON results.
     async testConnection() {
-        try {
-            const url = 'https://html.duckduckgo.com/html/?q=test';
-            const response = await fetch(url, {
-                signal: AbortSignal.timeout(10000),
-                headers: {
-                    'Accept': 'text/html',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                },
-            });
+        for (const baseUrl of this._instances) {
+            try {
+                const url = `${baseUrl}/search?q=test&format=json`;
+                const response = await fetch(url, {
+                    signal: AbortSignal.timeout(10000),
+                    // No custom headers — avoid CORS preflight failures.
+                    // format=json URL parameter already requests JSON output.
+                });
 
-            if (response.ok) {
-                const html = await response.text();
-                if (!html.includes('challenge-form') && !html.includes('anomaly-modal')) {
-                    return { ok: true };
+                if (!response.ok) {
+                    console.log(`[WebSearch] Test: ${baseUrl} HTTP ${response.status}`);
+                    continue;
                 }
-                return { ok: false, error: 'DuckDuckGo returned a challenge page' };
-            }
 
-            return { ok: false, error: `HTTP ${response.status}` };
-        } catch (err) {
-            return { ok: false, error: err.message };
+                // Read as text first, then parse as JSON. Content-type header
+                // is unreliable — many SearXNG instances return text/html for JSON.
+                const text = await response.text();
+                let data;
+                try {
+                    data = JSON.parse(text);
+                } catch (parseErr) {
+                    console.log(`[WebSearch] Test: ${baseUrl} returned non-JSON response`);
+                    continue;
+                }
+                if (data && Array.isArray(data.results)) {
+                    return { ok: true, instance: baseUrl, results: data.results.length };
+                }
+            } catch (err) {
+                const errType = err.name || 'Error';
+                console.log(`[WebSearch] Test: ${baseUrl} failed: [${errType}] ${err.message}`);
+            }
         }
+
+        return { ok: false, error: 'All SearXNG instances unreachable' };
     },
 
     // --- Build search context for LLM ---
