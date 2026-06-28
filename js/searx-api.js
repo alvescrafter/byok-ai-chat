@@ -14,13 +14,21 @@
 const WebSearchAPI = {
     // SearXNG public instances that support JSON output (format=json).
     // These are tried in order — if one fails, the next is attempted.
-    // Verified working as of 2026-06-27. Public instances can go offline,
-    // so we maintain multiple for redundancy.
+    // Verified working as of 2026-06-28. Public instances can go offline
+    // or start rate-limiting (HTTP 429), so we maintain multiple for redundancy.
+    //
+    // Primary instances return full search results from active engines (bing,
+    // duckduckgo, brave, wikipedia). Fallback instances return valid JSON but
+    // may have fewer active engines — they're kept as last-resort failover.
     _instances: [
-        'https://search.mdosch.de',
-        'https://searx.linxx.net',
-        'https://search.wdpserver.com',
-        'https://search.url4irl.com',
+        // Primary — full results from multiple search engines
+        'https://searx.oloke.xyz',
+        'https://search.seddens.net',
+        'https://etsi.me',
+        // Fallback — valid JSON, sparse results (some engines suspended)
+        'https://searx.tuxcloud.net',
+        'https://searx.party',
+        'https://searx.sev.monster',
     ],
 
     // --- Search ---
