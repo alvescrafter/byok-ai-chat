@@ -15,28 +15,18 @@ const App = (() => {
     let screenshotData = null; // attached screenshot data URL
     let attachedFiles = [];     // attached files (images + text)
     let streamPort = null;     // port for streaming communication with service worker
-    let webSearchMode = 'off'; // web search mode: 'off', 'quick', 'medium', 'deep', 'custom'
+    let webSearchMode = 'off'; // web search mode: 'off' or 'on'
 
     // --- DOM References ---
     const $ = (id) => document.getElementById(id);
 
     // --- Web Search Helpers ---
-    const SEARCH_MODE_NAMES = {
-        off: 'Off',
-        quick: 'Quick Search',
-        medium: 'Medium Search',
-        deep: 'Deep Search',
-        custom: 'Custom Search',
-    };
-
     function getMaxSearches(mode) {
-        switch (mode) {
-            case 'quick':  return 2;
-            case 'medium': return 5;
-            case 'deep':   return 10;
-            case 'custom': return settings.maxSearchRounds || 5;
-            default:       return 0;
-        }
+        return mode === 'off' ? 0 : 1;
+    }
+
+    function normalizeWebSearchMode(mode, enabledFallback = false) {
+        return mode && mode !== 'off' ? 'on' : (enabledFallback ? 'on' : 'off');
     }
 
     // --- Initialization ---
@@ -51,11 +41,10 @@ const App = (() => {
         $('theme-select').value = theme;
         updateHljsTheme(theme);
 
-        // Apply web search mode from settings (backward compat: webSearchEnabled true → 'custom')
-        webSearchMode = settings.webSearchMode || (settings.webSearchEnabled ? 'custom' : 'off');
+        // Apply web search mode from settings (backward compat: old named modes -> 'on')
+        webSearchMode = normalizeWebSearchMode(settings.webSearchMode, settings.webSearchEnabled);
         updateWebSearchButton();
         updateWebSearchMenuActive();
-        updateCustomSearchCount();
 
         // Populate provider/model dropdowns
         UI.populateProviderSelect($('provider-select'), settings);
@@ -150,7 +139,7 @@ const App = (() => {
 
         // Web search dropdown
         $('web-search-btn').addEventListener('click', handleWebSearchButtonClick);
-        $('web-search-menu').addEventListener('click', handleWebSearchMenuClick);
+        if ($('web-search-menu')) $('web-search-menu').addEventListener('click', handleWebSearchMenuClick);
         document.addEventListener('click', handleWebSearchOutsideClick);
 
         // Conversation rename event
@@ -284,7 +273,7 @@ const App = (() => {
 
         // Start streaming (with or without web search)
         if (webSearchMode !== 'off') {
-            await handleSendWithSearch(conversation, messages);
+            await handleSendWithResearch(conversation, messages);
         } else {
             startStreaming(messages);
         }
@@ -341,6 +330,345 @@ const App = (() => {
             },
             settings,
         });
+    }
+
+    // --- Handle Send with Web Research (Search + Visit Loop) ---
+    async function handleSendWithResearch(conversation, messages) {
+        const userContent = messages[messages.length - 1]?.content || '';
+        const maxSearches = getMaxSearches(webSearchMode);
+        const maxVisits = Math.max(2, Math.min(12, maxSearches * 2));
+        const now = new Date().toLocaleString();
+        const statusContainer = showSearchStatusContainer();
+
+        try {
+            const planningEl = showPlanningStatus(statusContainer);
+            const planningMessages = [
+                {
+                    role: 'system',
+                    content: `You are a research assistant. Given a user's question, generate one focused web search query.
+
+Current date and time: ${now}
+
+Use current dates in the query when recency matters. Return ONLY the search query. No numbering, markdown, explanation, or quotes.`
+                },
+                { role: 'user', content: userContent },
+            ];
+
+            const planResponse = await callLLM(planningMessages, { temperature: 0.3, maxTokens: 150, timeout: 20000 });
+            removeSearchStatus(planningEl);
+
+            let queries = parsePlannedQueries(planResponse);
+            if (queries.length === 0) {
+                console.log('[WebSearch] No queries parsed from LLM response, using user question as fallback');
+                queries = [userContent.slice(0, 200)];
+            }
+
+            const allResults = [];
+            const visitedPages = [];
+            const seenUrls = new Set();
+            const visitedUrls = new Set();
+            const usedQueries = new Set();
+            const searchedQueries = [];
+            let searchCount = 0;
+            let visitCount = 0;
+            let satisfied = false;
+            let actions = queries.slice(0, maxSearches).map(query => ({ type: 'search', value: query }));
+
+            while (!satisfied && (searchCount < maxSearches || visitCount < maxVisits)) {
+                while (actions.length > 0 && (searchCount < maxSearches || visitCount < maxVisits)) {
+                    const action = actions.shift();
+
+                    if (action.type === 'search') {
+                        const query = action.value.trim();
+                        if (!query || usedQueries.has(query.toLowerCase()) || searchCount >= maxSearches) continue;
+                        usedQueries.add(query.toLowerCase());
+                        searchedQueries.push(query);
+                        searchCount++;
+
+                        const searchEl = showSearchRoundStatus(statusContainer, query, searchCount, maxSearches);
+                        const searchResults = await performWebSearch(query);
+
+                        if (searchResults && searchResults.results && searchResults.results.length > 0) {
+                            for (const result of searchResults.results) {
+                                if (result.url && !seenUrls.has(result.url)) {
+                                    seenUrls.add(result.url);
+                                    allResults.push({ ...result, query });
+                                }
+                            }
+                            finalizeSearchRoundStatus(searchEl, query, searchResults.results.length);
+                        } else {
+                            failSearchRoundStatus(searchEl, query);
+                        }
+                    }
+
+                    if (action.type === 'visit') {
+                        const url = resolveVisitTarget(action.value, allResults);
+                        if (!url || visitedUrls.has(url) || visitCount >= maxVisits) continue;
+                        visitedUrls.add(url);
+                        visitCount++;
+
+                        const visitEl = showVisitStatus(statusContainer, url, visitCount, maxVisits);
+                        const page = await performVisitWebsite(url);
+
+                        if (page && page.text) {
+                            visitedPages.push(page);
+                            finalizeVisitStatus(visitEl, page);
+                        } else {
+                            failVisitStatus(visitEl, url);
+                        }
+                    }
+                }
+
+                const canSearchMore = searchCount < maxSearches;
+                const canVisitMore = visitCount < maxVisits && allResults.some(r => r.url && !visitedUrls.has(r.url));
+                if (!canSearchMore && !canVisitMore) break;
+
+                const reviewEl = showReviewStatus(statusContainer);
+                const reviewMessages = buildResearchReviewMessages({
+                    userContent,
+                    allResults,
+                    visitedPages,
+                    visitedUrls,
+                    searchCount,
+                    maxSearches,
+                    visitCount,
+                    maxVisits,
+                    now,
+                });
+
+                const reviewResponse = await callLLM(reviewMessages, { temperature: 0.2, maxTokens: 260, timeout: 25000 });
+                removeSearchStatus(reviewEl);
+
+                const nextActions = parseResearchActions(reviewResponse, allResults)
+                    .filter(action => {
+                        if (action.type === 'search') {
+                            return canSearchMore && action.value && !usedQueries.has(action.value.toLowerCase());
+                        }
+                        if (action.type === 'visit') {
+                            const url = resolveVisitTarget(action.value, allResults);
+                            return canVisitMore && url && !visitedUrls.has(url);
+                        }
+                        return false;
+                    })
+                    .slice(0, 2);
+
+                if (nextActions.length === 0) {
+                    satisfied = true;
+                } else {
+                    actions.push(...nextActions);
+                }
+            }
+
+            removeSearchStatusContainer(statusContainer);
+
+            if (allResults.length === 0 && visitedPages.length === 0) {
+                UI.toast('No search results found, answering without web context', 'info');
+                startStreaming(messages);
+                return;
+            }
+
+            if (!satisfied && searchCount >= maxSearches) {
+                UI.toast(`Max searches (${maxSearches}) reached, answering with available info`, 'info');
+            }
+
+            const contextBlock = buildFinalResearchContext({
+                allResults,
+                visitedPages,
+                queriesUsed: searchedQueries,
+                now,
+            });
+
+            const finalMessages = messages.map(m => ({ ...m }));
+            const systemIdx = finalMessages.findIndex(m => m.role === 'system');
+            if (systemIdx >= 0) {
+                finalMessages[systemIdx] = {
+                    ...finalMessages[systemIdx],
+                    content: finalMessages[systemIdx].content + '\n\n' + contextBlock,
+                };
+            } else {
+                finalMessages.unshift({ role: 'system', content: contextBlock });
+            }
+
+            startStreaming(finalMessages);
+        } catch (err) {
+            console.error('[WebSearch] Error:', err);
+            removeSearchStatusContainer(statusContainer);
+            UI.toast('Web search failed, answering without search', 'error');
+            startStreaming(messages);
+        }
+    }
+
+    function parsePlannedQueries(response) {
+        return (response || '')
+            .split('\n')
+            .map(q => q.replace(/^\d+[\.\)]\s*/, '').trim())
+            .map(q => q.replace(/^[`*#>]+\s*/, '').trim())
+            .filter(q => q.length > 0)
+            .filter(q => !q.startsWith('```'))
+            .filter(q => {
+                const lower = q.toLowerCase();
+                return !lower.startsWith('here are') &&
+                       !lower.startsWith('search queries') &&
+                       !lower.startsWith("i'll ") &&
+                       !lower.startsWith('i will ') &&
+                       !lower.startsWith('let me ') &&
+                       !lower.startsWith('sure') &&
+                       !lower.startsWith('okay') &&
+                       !lower.startsWith('of course') &&
+                       !lower.startsWith('certainly') &&
+                       !lower.startsWith('to answer') &&
+                       !lower.startsWith('based on') &&
+                       !lower.startsWith('these are') &&
+                       !lower.startsWith('the following') &&
+                       !lower.startsWith('i need') &&
+                       !lower.startsWith('i should');
+            });
+    }
+
+    function buildResearchReviewMessages(context) {
+        const {
+            userContent,
+            allResults,
+            visitedPages,
+            visitedUrls,
+            searchCount,
+            maxSearches,
+            visitCount,
+            maxVisits,
+            now,
+        } = context;
+
+        const searchContext = allResults.length > 0
+            ? allResults.map((r, i) => {
+                const wasRead = visitedPages.some(p => p.url === r.url || p.requestedUrl === r.url);
+                const visitState = wasRead ? 'read' : (visitedUrls.has(r.url) ? 'visit failed' : 'not visited');
+                return `[${i + 1}] ${r.title} (${r.source}) [${visitState}] [query: "${r.query}"]\nURL: ${r.url}\n${r.snippet || ''}`;
+            }).join('\n\n')
+            : 'No search results collected yet.';
+
+        const pageContext = visitedPages.length > 0
+            ? visitedPages.map((p, i) => {
+                const excerpt = (p.text || '').slice(0, 1600);
+                return `[P${i + 1}] ${p.title} (${p.source})\nURL: ${p.url}\n${p.metaDescription || ''}\n${excerpt}`;
+            }).join('\n\n')
+            : 'No pages visited yet.';
+
+        return [
+            {
+                role: 'system',
+                content: `You are controlling web research tools for an AI chat answer.
+
+Current date and time: ${now}
+User question: ${userContent}
+
+Search budget used: ${searchCount}/${maxSearches}
+Visit budget used: ${visitCount}/${maxVisits}
+
+Search results:
+${searchContext}
+
+Visited pages:
+${pageContext}
+
+Decide the next step.
+
+Reply with exactly one of these formats:
+ANSWER
+SEARCH: <new focused search query>
+VISIT: <result number or URL>
+
+Use VISIT when a search result looks relevant but snippets are not enough. Use SEARCH when the available results are missing key facts or need corroboration. Ask for at most 2 actions, one per line.`
+            },
+            { role: 'user', content: 'Choose the next research action, or ANSWER if the gathered context is sufficient.' },
+        ];
+    }
+
+    function parseResearchActions(response, allResults) {
+        const lines = (response || '').split('\n').map(line => line.trim()).filter(Boolean);
+        const actions = [];
+
+        for (const line of lines) {
+            const searchMatch = line.match(/^SEARCH:\s*(.+)$/i);
+            if (searchMatch) {
+                actions.push({ type: 'search', value: searchMatch[1].trim() });
+                continue;
+            }
+
+            const visitMatch = line.match(/^VISIT:\s*(.+)$/i);
+            if (visitMatch) {
+                actions.push({ type: 'visit', value: visitMatch[1].trim() });
+                continue;
+            }
+
+            const upper = line.toUpperCase();
+            if (upper === 'ANSWER' || upper.startsWith('ANSWER ')) {
+                break;
+            }
+        }
+
+        return actions.filter(action => {
+            if (action.type === 'search') return action.value.length > 0;
+            if (action.type === 'visit') return Boolean(resolveVisitTarget(action.value, allResults));
+            return false;
+        });
+    }
+
+    function resolveVisitTarget(value, allResults) {
+        const target = (value || '').trim();
+        if (!target) return '';
+
+        const urlMatch = target.match(/https?:\/\/[^\s>)\]]+/i);
+        if (urlMatch) return urlMatch[0];
+
+        const numberMatch = target.match(/\d+/);
+        if (numberMatch) {
+            const index = parseInt(numberMatch[0], 10) - 1;
+            return allResults[index]?.url || '';
+        }
+
+        return '';
+    }
+
+    function buildFinalResearchContext({ allResults, visitedPages, queriesUsed, now }) {
+        const sources = [];
+
+        for (const page of visitedPages) {
+            sources.push({
+                title: page.title,
+                source: page.source,
+                url: page.url,
+                text: `${page.metaDescription ? page.metaDescription + '\n' : ''}${page.text || ''}`.trim(),
+            });
+        }
+
+        for (const result of allResults) {
+            if (sources.some(source => source.url === result.url)) continue;
+            sources.push({
+                title: result.title,
+                source: result.source,
+                url: result.url,
+                text: result.snippet || '',
+            });
+        }
+
+        let body = '';
+        let includedCount = 0;
+        for (let i = 0; i < sources.length; i++) {
+            const source = sources[i];
+            const next = `[${i + 1}] ${source.title || 'Untitled'} (${source.source || 'Unknown'})\nURL: ${source.url}\n${source.text || ''}\n\n`;
+            if ((body + next).length > 28000) break;
+            body += next;
+            includedCount++;
+        }
+
+        return `[Web Research Context - ${includedCount} sources]
+Searches performed: ${queriesUsed.length > 0 ? queriesUsed.join(' | ') : 'none'}
+Current date: ${now}
+
+${body.trim()}
+[/Web Research Context]
+
+Use the web research context to answer the user's question. Cite sources with [number] references. Prioritize visited page text over snippets, and say when the gathered sources do not cover part of the question.`;
     }
 
     // --- Handle Send with Web Search (Iterative Multi-Query Protocol) ---
@@ -607,9 +935,11 @@ Use the above search results to inform your answer. Cite sources using [number] 
     }
 
     // --- Perform Web Search ---
-    // Sends search request to the service worker with a 15s timeout.
+    // Sends search request to the service worker with a 25s timeout.
     // Resolves with { results, query, provider } on success, or null on failure.
     // Errors are logged and surfaced to the caller (not silently swallowed).
+    // 25s allows the fast tier (SearXNG + DDG + Wikipedia in parallel, ~10s)
+    // plus a few slow-tier SearXNG attempts before giving up.
     async function performWebSearch(query) {
         return new Promise((resolve) => {
             let settled = false;
@@ -619,7 +949,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
                     console.error('[WebSearch] Timeout for query:', query);
                     resolve(null);
                 }
-            }, 15000);
+            }, 25000);
 
             chrome.runtime.sendMessage({
                 type: 'WEB_SEARCH',
@@ -639,6 +969,45 @@ Use the above search results to inform your answer. Cite sources using [number] 
                     resolve(response.data);
                 } else {
                     console.error('[WebSearch] Error:', response?.error || 'Unknown error');
+                    resolve(null);
+                }
+            });
+        });
+    }
+
+    // --- Visit Website ---
+    // Sends a page visit request to the service worker and resolves with
+    // extracted readable text on success, or null on failure.
+    async function performVisitWebsite(url) {
+        return new Promise((resolve) => {
+            let settled = false;
+            const timeoutId = setTimeout(() => {
+                if (!settled) {
+                    settled = true;
+                    console.error('[WebSearch] Visit timeout for URL:', url);
+                    resolve(null);
+                }
+            }, 20000);
+
+            chrome.runtime.sendMessage({
+                type: 'VISIT_WEBSITE',
+                url,
+                maxTextLength: 6000,
+            }, (response) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeoutId);
+
+                if (chrome.runtime.lastError) {
+                    console.error('[WebSearch] Visit runtime error:', chrome.runtime.lastError.message);
+                    resolve(null);
+                    return;
+                }
+
+                if (response?.success) {
+                    resolve(response.data);
+                } else {
+                    console.error('[WebSearch] Visit error:', response?.error || 'Unknown error');
                     resolve(null);
                 }
             });
@@ -698,6 +1067,32 @@ Use the above search results to inform your answer. Cite sources using [number] 
         return div;
     }
 
+    function showVisitStatus(container, url, visitNum, maxVisits) {
+        const div = document.createElement('div');
+        div.className = 'search-status visiting';
+        div.innerHTML = `<span class="search-round-badge">${visitNum}/${maxVisits}</span> <span class="search-icon">-&gt;</span> <span>Visiting: <span class="search-query">${UI.escapeHtml(url)}</span></span>`;
+        container.appendChild(div);
+        UI.scrollToBottom($('chat-container'));
+        return div;
+    }
+
+    function finalizeVisitStatus(el, page) {
+        if (el) {
+            el.className = 'search-status done';
+            const title = page?.title || page?.source || 'page';
+            el.innerHTML = `<span class="search-round-badge done">OK</span> <span class="search-icon">-&gt;</span> <span>Read: <span class="search-query">${UI.escapeHtml(title)}</span></span>`;
+            UI.scrollToBottom($('chat-container'));
+        }
+    }
+
+    function failVisitStatus(el, url) {
+        if (el) {
+            el.className = 'search-status done';
+            el.innerHTML = `<span class="search-round-badge failed">X</span> <span class="search-icon">-&gt;</span> <span>Could not read: <span class="search-query">${UI.escapeHtml(url)}</span></span>`;
+            UI.scrollToBottom($('chat-container'));
+        }
+    }
+
     function removeSearchStatus(el) {
         if (el) el.remove();
     }
@@ -714,7 +1109,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
             setWebSearchMode('off');
         } else {
             // Search is off — open the dropdown menu
-            toggleWebSearchMenu();
+            setWebSearchMode('on');
         }
     }
 
@@ -736,7 +1131,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
     }
 
     function setWebSearchMode(mode) {
-        webSearchMode = mode;
+        webSearchMode = normalizeWebSearchMode(mode);
         updateWebSearchButton();
         updateWebSearchMenuActive();
 
@@ -754,11 +1149,10 @@ Use the above search results to inform your answer. Cite sources using [number] 
             });
         }
 
-        if (mode === 'off') {
+        if (webSearchMode === 'off') {
             UI.toast('Web search off', 'info');
         } else {
-            const count = getMaxSearches(mode);
-            UI.toast(`🌐 ${SEARCH_MODE_NAMES[mode]} on (${count} searches)`, 'success');
+            UI.toast('Web search on', 'success');
         }
     }
 
@@ -767,7 +1161,6 @@ Use the above search results to inform your answer. Cite sources using [number] 
         if (!menu) return;
         if (menu.style.display === 'none') {
             updateWebSearchMenuActive();
-            updateCustomSearchCount();
             menu.style.display = 'flex';
         } else {
             menu.style.display = 'none';
@@ -784,8 +1177,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
         if (!btn) return;
         if (webSearchMode !== 'off') {
             btn.classList.add('web-search-active');
-            const count = getMaxSearches(webSearchMode);
-            btn.title = `${SEARCH_MODE_NAMES[webSearchMode]} (${count} searches) — click to turn off`;
+            btn.title = 'Web search on - click to turn off';
         } else {
             btn.classList.remove('web-search-active');
             btn.title = 'Toggle web search';
@@ -802,11 +1194,6 @@ Use the above search results to inform your answer. Cite sources using [number] 
                 item.classList.remove('active');
             }
         });
-    }
-
-    function updateCustomSearchCount() {
-        const el = $('custom-search-count');
-        if (el) el.textContent = `(${settings.maxSearchRounds || 5})`;
     }
 
     // --- Stream Handling ---
@@ -977,8 +1364,8 @@ Use the above search results to inform your answer. Cite sources using [number] 
         if (convo.provider) $('provider-select').value = convo.provider;
         if (convo.model) $('model-select').value = convo.model;
 
-        // Restore web search mode from conversation (backward compat: webSearchEnabled true → 'custom')
-        webSearchMode = convo.webSearchMode ?? (convo.webSearchEnabled ? 'custom' : null) ?? settings.webSearchMode ?? 'off';
+        // Restore web search mode from conversation (backward compat: old named modes -> 'on')
+        webSearchMode = normalizeWebSearchMode(convo.webSearchMode ?? settings.webSearchMode, convo.webSearchEnabled ?? settings.webSearchEnabled);
         updateWebSearchButton();
         updateWebSearchMenuActive();
     }
@@ -1308,9 +1695,6 @@ Use the above search results to inform your answer. Cite sources using [number] 
         $('custom-apikey').value = p.custom?.apiKey || '';
         $('custom-model').value = p.custom?.model || '';
 
-        // Web search settings
-        $('max-search-rounds').value = settings.maxSearchRounds || 5;
-        updateCustomSearchCount();
     }
 
     async function handleSaveSettings() {
@@ -1322,12 +1706,6 @@ Use the above search results to inform your answer. Cite sources using [number] 
             lmstudio: { apiKey: '', baseUrl: $('lmstudio-baseurl').value || 'http://localhost:1234/v1' },
             custom: { apiKey: $('custom-apikey').value, baseUrl: $('custom-baseurl').value, model: $('custom-model').value },
         };
-
-        // Web search settings
-        settings.maxSearchRounds = parseInt($('max-search-rounds').value, 10) || 5;
-        updateCustomSearchCount();
-        // If currently in custom mode, refresh button tooltip with new count
-        if (webSearchMode === 'custom') updateWebSearchButton();
 
         await Storage.saveSettings(settings);
 
@@ -1513,12 +1891,18 @@ Use the above search results to inform your answer. Cite sources using [number] 
             if (response?.ok) {
                 btn.textContent = '✓ Connected';
                 btn.classList.add('success');
+                const providerLabels = {
+                    searxng: 'SearXNG',
+                    duckduckgo: 'DuckDuckGo',
+                    wikipedia: 'Wikipedia',
+                };
+                const providerLabel = providerLabels[response.provider] || response.provider || 'search';
                 const instance = response.instance ? ` (${response.instance})` : '';
-                UI.toast(`SearXNG search connected${instance} — ${response.results} results`, 'success');
+                UI.toast(`Web search connected via ${providerLabel}${instance} — ${response.results} results`, 'success');
             } else {
                 btn.textContent = '✗ Failed';
                 btn.classList.add('error');
-                UI.toast(response?.error || 'SearXNG connection failed', 'error');
+                UI.toast(response?.error || 'Web search connection failed', 'error');
             }
 
             setTimeout(() => {

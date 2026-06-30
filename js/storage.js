@@ -236,7 +236,6 @@ const Storage = (() => {
             enableTTS: false,
             webSearchEnabled: false,
             webSearchMode: 'off',
-            maxSearchRounds: 5,
         };
     }
 

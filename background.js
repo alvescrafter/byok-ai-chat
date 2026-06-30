@@ -72,6 +72,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             handleWebSearch(message, sendResponse);
             return true; // async
 
+        case 'VISIT_WEBSITE':
+            handleVisitWebsite(message, sendResponse);
+            return true; // async
+
         case 'WEB_SEARCH_TEST':
             handleWebSearchTest(sendResponse);
             return true; // async
@@ -310,6 +314,20 @@ async function handleWebSearch(message, sendResponse) {
     }
 }
 
+// --- Handler: Visit Website ---
+async function handleVisitWebsite(message, sendResponse) {
+    try {
+        const { url, maxTextLength } = message;
+        const result = await WebSearchAPI.visit(url, {
+            maxTextLength: maxTextLength || 6000,
+            timeout: 15000,
+        });
+        sendResponse({ success: true, data: result });
+    } catch (error) {
+        sendResponse({ success: false, error: error.message });
+    }
+}
+
 // --- Handler: Web Search Test ---
 async function handleWebSearchTest(sendResponse) {
     try {
@@ -319,5 +337,3 @@ async function handleWebSearchTest(sendResponse) {
         sendResponse({ ok: false, error: error.message });
     }
 }
-
-

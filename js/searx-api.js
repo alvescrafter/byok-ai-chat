@@ -1,120 +1,480 @@
 /**
  * BYOK AI Chat - Web Search API Module
- * Handles web search via SearXNG public instances (JSON API).
- * No API key needed. Designed to run in the service worker context.
- *
- * SearXNG is a privacy-focused meta-search engine that aggregates results
- * from Google, Bing, DuckDuckGo, Wikipedia, and more. Public instances
- * handle bot-detection server-side, so we get clean JSON results without
- * CAPTCHAs. The file is named searx-api.js because it was always intended
- * to use SearXNG — the previous DuckDuckGo HTML scraping approach broke
- * when DDG started serving CAPTCHA challenge pages to all automated requests.
+ * Handles web search via SearXNG public instances and readable page visits.
+ * Designed to run in the background service worker.
  */
 
 const WebSearchAPI = {
-    // SearXNG public instances that support JSON output (format=json).
-    // These are tried in order — if one fails, the next is attempted.
-    // Verified working as of 2026-06-28. Public instances can go offline
-    // or start rate-limiting (HTTP 429), so we maintain multiple for redundancy.
-    //
-    // Primary instances return full search results from active engines (bing,
-    // duckduckgo, brave, wikipedia). Fallback instances return valid JSON but
-    // may have fewer active engines — they're kept as last-resort failover.
+    // Public SearXNG instances are volatile. Prefer live discovery from
+    // searx.space, then fall back to a curated list if discovery fails.
     _instances: [
-        // Primary — full results from multiple search engines
+        'https://searxng.cups.moe',
+        'https://searxng.canine.tools',
+        'https://searxng.gr',
+        'https://searx.perennialte.ch',
+        'https://search.inetol.net',
+        'https://searx.tiekoetter.com',
+        'https://searx.be',
+        'https://northboot.xyz',
         'https://searx.oloke.xyz',
         'https://search.seddens.net',
         'https://etsi.me',
-        // Fallback — valid JSON, sparse results (some engines suspended)
         'https://searx.tuxcloud.net',
         'https://searx.party',
         'https://searx.sev.monster',
     ],
+    _discoveredInstances: null,
+    _discoveryExpiresAt: 0,
+    _lastWorkingInstance: '',
+    _discoveryInFlight: null,
 
-    // --- Search ---
-    // Queries SearXNG instances and returns formatted results.
     async search(query) {
         if (!query) {
             throw new Error('Query is required');
         }
 
-        const encodedQuery = encodeURIComponent(query);
+        const candidates = this._getCandidateInstances();
 
-        for (const baseUrl of this._instances) {
+        // Fast tier: try the first few SearXNG instances + DuckDuckGo + Wikipedia
+        // in parallel. This ensures fallback providers are reached quickly even
+        // when all SearXNG instances are rate-limited or down (the common case).
+        const fastBatch = candidates.slice(0, 4);
+        const fastPromises = [
+            ...fastBatch.map(baseUrl => this._searchInstance(baseUrl, query)),
+            this._searchDuckDuckGo(query),
+            this._searchWikipedia(query),
+        ];
+        const fastResults = await Promise.all(fastPromises);
+        for (const result of fastResults) {
+            if (result && result.results.length > 0) return result;
+        }
+
+        console.log('[WebSearch] Fast tier exhausted; trying remaining SearXNG instances');
+
+        // Slow tier: remaining curated SearXNG instances, sequentially
+        const remaining = candidates.slice(4);
+        for (const baseUrl of remaining) {
+            const result = await this._searchInstance(baseUrl, query);
+            if (result) return result;
+        }
+
+        // Last resort: refresh discovered instances and try new ones
+        const discovered = await this._refreshDiscoveredInstances();
+        const known = new Set(candidates);
+        const newCandidates = this._dedupeInstances(discovered || []).filter(url => !known.has(url));
+        for (const baseUrl of newCandidates) {
+            const result = await this._searchInstance(baseUrl, query);
+            if (result) return result;
+        }
+
+        console.log('[WebSearch] All search providers failed');
+        return { results: [], query, provider: 'none' };
+    },
+
+    async _searchDuckDuckGo(query) {
+        try {
+            const params = new URLSearchParams({
+                q: query,
+                format: 'json',
+                no_html: '1',
+                skip_disambig: '1',
+            });
+            const url = `https://api.duckduckgo.com/?${params.toString()}`;
+            const response = await fetch(url, {
+                signal: AbortSignal.timeout(10000),
+            });
+
+            if (!response.ok) {
+                console.log(`[WebSearch] DuckDuckGo returned HTTP ${response.status}`);
+                return null;
+            }
+
+            const text = await response.text();
+            let data;
             try {
-                const url = `${baseUrl}/search?q=${encodedQuery}&format=json`;
+                data = JSON.parse(text);
+            } catch {
+                console.log('[WebSearch] DuckDuckGo returned non-JSON response');
+                return null;
+            }
 
-                const response = await fetch(url, {
-                    signal: AbortSignal.timeout(12000),
-                    // No custom headers — adding Accept: application/json triggers a CORS
-                    // preflight (OPTIONS) request, which many SearXNG instances don't
-                    // handle properly. The format=json URL parameter already tells
-                    // SearXNG to return JSON.
+            const results = [];
+            const seenUrls = new Set();
+
+            if (data.Abstract && data.AbstractURL) {
+                const absUrl = this._normalizeVisitUrl(data.AbstractURL);
+                if (absUrl && !seenUrls.has(absUrl)) {
+                    seenUrls.add(absUrl);
+                    results.push({
+                        title: this._cleanText(data.Heading || data.Abstract.split('.')[0] || 'DuckDuckGo Answer'),
+                        url: absUrl,
+                        snippet: this._cleanText(data.Abstract),
+                        source: this._sourceFromUrl(absUrl),
+                        engine: 'duckduckgo',
+                    });
+                }
+            }
+
+            const topics = Array.isArray(data.RelatedTopics) ? data.RelatedTopics : [];
+            for (const topic of topics) {
+                if (results.length >= 10) break;
+                if (!topic || typeof topic !== 'object') continue;
+                if (topic.Topics) continue;
+                if (!topic.FirstURL || !topic.Text) continue;
+                const tUrl = this._normalizeVisitUrl(topic.FirstURL);
+                if (!tUrl || seenUrls.has(tUrl)) continue;
+                seenUrls.add(tUrl);
+                const textParts = String(topic.Text).split(' - ');
+                results.push({
+                    title: this._cleanText(textParts[0] || topic.Text),
+                    url: tUrl,
+                    snippet: this._cleanText(topic.Text),
+                    source: this._sourceFromUrl(tUrl),
+                    engine: 'duckduckgo',
+                });
+            }
+
+            if (results.length === 0) {
+                console.log('[WebSearch] DuckDuckGo returned 0 parseable results');
+                return null;
+            }
+
+            console.log(`[WebSearch] DuckDuckGo returned ${results.length} results`);
+            return { results, query, provider: 'duckduckgo', instance: 'api.duckduckgo.com' };
+        } catch (err) {
+            const errType = err.name || 'Error';
+            console.log(`[WebSearch] DuckDuckGo failed: [${errType}] ${err.message}`);
+            return null;
+        }
+    },
+
+    async _searchWikipedia(query) {
+        try {
+            const params = new URLSearchParams({
+                action: 'query',
+                list: 'search',
+                srsearch: query,
+                srlimit: '10',
+                format: 'json',
+                origin: '*',
+            });
+            const url = `https://en.wikipedia.org/w/api.php?${params.toString()}`;
+            const response = await fetch(url, {
+                signal: AbortSignal.timeout(10000),
+            });
+
+            if (!response.ok) {
+                console.log(`[WebSearch] Wikipedia returned HTTP ${response.status}`);
+                return null;
+            }
+
+            const text = await response.text();
+            let data;
+            try {
+                data = JSON.parse(text);
+            } catch {
+                console.log('[WebSearch] Wikipedia returned non-JSON response');
+                return null;
+            }
+
+            const searchItems = data?.query?.search;
+            if (!Array.isArray(searchItems) || searchItems.length === 0) {
+                console.log('[WebSearch] Wikipedia returned 0 parseable results');
+                return null;
+            }
+
+            const results = [];
+            const seenUrls = new Set();
+            for (const item of searchItems) {
+                if (results.length >= 10) break;
+                if (!item.title) continue;
+                const title = this._cleanText(item.title);
+                const pageUrl = `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replace(/ /g, '_'))}`;
+                const normalized = this._normalizeVisitUrl(pageUrl);
+                if (!normalized || seenUrls.has(normalized)) continue;
+                seenUrls.add(normalized);
+                results.push({
+                    title,
+                    url: normalized,
+                    snippet: this._cleanText(item.snippet || ''),
+                    source: 'en.wikipedia.org',
+                    engine: 'wikipedia',
+                });
+            }
+
+            if (results.length === 0) {
+                console.log('[WebSearch] Wikipedia returned 0 parseable results');
+                return null;
+            }
+
+            console.log(`[WebSearch] Wikipedia returned ${results.length} results`);
+            return { results, query, provider: 'wikipedia', instance: 'en.wikipedia.org' };
+        } catch (err) {
+            const errType = err.name || 'Error';
+            console.log(`[WebSearch] Wikipedia failed: [${errType}] ${err.message}`);
+            return null;
+        }
+    },
+
+    async _searchInstance(baseUrl, query) {
+        try {
+            const params = new URLSearchParams({
+                q: query,
+                format: 'json',
+                categories: 'general',
+                language: 'auto',
+                safesearch: '0',
+            });
+            const url = `${baseUrl}/search?${params.toString()}`;
+            const response = await fetch(url, {
+                signal: AbortSignal.timeout(8000),
+            });
+
+            if (!response.ok) {
+                console.log(`[WebSearch] ${baseUrl} returned HTTP ${response.status}`);
+                return null;
+            }
+
+            const text = await response.text();
+            let data;
+            try {
+                data = JSON.parse(text);
+            } catch {
+                console.log(`[WebSearch] ${baseUrl} returned non-JSON response (len=${text.length})`);
+                return null;
+            }
+
+            if (data && Array.isArray(data.results) && data.results.length > 0) {
+                const results = this._parseSearXngResults(data.results);
+                if (results.length > 0) {
+                    console.log(`[WebSearch] ${baseUrl} returned ${results.length} results`);
+                    this._lastWorkingInstance = baseUrl;
+                    return { results, query, provider: 'searxng', instance: baseUrl };
+                }
+            }
+
+            console.log(`[WebSearch] ${baseUrl} returned 0 parseable results`);
+        } catch (err) {
+            const errType = err.name || 'Error';
+            console.log(`[WebSearch] ${baseUrl} failed: [${errType}] ${err.message}`);
+        }
+
+        return null;
+    },
+
+    async visit(url, options = {}) {
+        const maxTextLength = options.maxTextLength || 6000;
+        const normalizedUrl = this._normalizeVisitUrl(url);
+        if (!normalizedUrl) {
+            throw new Error('Only http and https URLs can be visited');
+        }
+
+        const response = await fetch(normalizedUrl, {
+            redirect: 'follow',
+            headers: {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5',
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
+            signal: AbortSignal.timeout(options.timeout || 15000),
+        });
+
+        if (!response.ok) {
+            throw new Error(`Website returned HTTP ${response.status}`);
+        }
+
+        const contentType = response.headers.get('content-type') || '';
+        const lowerContentType = contentType.toLowerCase();
+        const isReadable =
+            lowerContentType.includes('text/') ||
+            lowerContentType.includes('html') ||
+            lowerContentType.includes('json') ||
+            lowerContentType.includes('xml');
+
+        if (!isReadable) {
+            throw new Error(`Unsupported content type: ${contentType || 'unknown'}`);
+        }
+
+        const raw = await response.text();
+        const isHtml = lowerContentType.includes('html') || /<html[\s>]/i.test(raw);
+        const title = isHtml ? this._extractTitle(raw) : '';
+        const metaDescription = isHtml ? this._extractMetaDescription(raw) : '';
+        const text = isHtml ? this._extractReadableText(raw) : this._cleanPlainText(raw);
+        const truncatedText = text.length > maxTextLength
+            ? text.slice(0, maxTextLength).trim() + '... [truncated]'
+            : text;
+
+        return {
+            url: response.url || normalizedUrl,
+            requestedUrl: normalizedUrl,
+            title: title || this._titleFromUrl(response.url || normalizedUrl),
+            source: this._sourceFromUrl(response.url || normalizedUrl),
+            contentType,
+            metaDescription,
+            text: truncatedText,
+            textLength: text.length,
+        };
+    },
+
+    async testConnection() {
+        const candidates = this._getCandidateInstances();
+
+        for (const baseUrl of candidates) {
+            try {
+                const params = new URLSearchParams({
+                    q: 'test',
+                    format: 'json',
+                    categories: 'general',
+                    safesearch: '0',
+                });
+                const response = await fetch(`${baseUrl}/search?${params.toString()}`, {
+                    signal: AbortSignal.timeout(10000),
                 });
 
                 if (!response.ok) {
-                    console.log(`[WebSearch] ${baseUrl} returned HTTP ${response.status}`);
+                    console.log(`[WebSearch] Test: ${baseUrl} HTTP ${response.status}`);
                     continue;
                 }
 
-                // Read as text first, then parse as JSON. We can't rely on the
-                // content-type header — many SearXNG instances return "text/html"
-                // even when serving valid JSON with format=json.
                 const text = await response.text();
                 let data;
                 try {
                     data = JSON.parse(text);
-                } catch (parseErr) {
-                    console.log(`[WebSearch] ${baseUrl} returned non-JSON response (len=${text.length})`);
+                } catch {
+                    console.log(`[WebSearch] Test: ${baseUrl} returned non-JSON response`);
                     continue;
                 }
 
-                // SearXNG JSON format: { query, results: [...], answers: [...], ... }
-                if (data && Array.isArray(data.results) && data.results.length > 0) {
-                    const results = this._parseSearXngResults(data.results);
-                    if (results.length > 0) {
-                        console.log(`[WebSearch] ${baseUrl} returned ${results.length} results`);
-                        return { results, query, provider: 'searxng', instance: baseUrl };
-                    }
+                if (data && Array.isArray(data.results)) {
+                    this._lastWorkingInstance = baseUrl;
+                    return { ok: true, provider: 'searxng', instance: baseUrl, results: data.results.length };
                 }
-
-                console.log(`[WebSearch] ${baseUrl} returned 0 parseable results`);
             } catch (err) {
-                // Log the full error type and message for diagnostics
                 const errType = err.name || 'Error';
-                console.log(`[WebSearch] ${baseUrl} failed: [${errType}] ${err.message}`);
+                console.log(`[WebSearch] Test: ${baseUrl} failed: [${errType}] ${err.message}`);
             }
         }
 
-        // All instances failed
-        console.log('[WebSearch] All SearXNG instances failed');
-        return { results: [], query, provider: 'none' };
+        console.log('[WebSearch] Test: SearXNG exhausted; trying fallback providers');
+
+        const ddgResult = await this._searchDuckDuckGo('test');
+        if (ddgResult && ddgResult.results.length > 0) {
+            return { ok: true, provider: 'duckduckgo', instance: 'api.duckduckgo.com', results: ddgResult.results.length };
+        }
+
+        const wikiResult = await this._searchWikipedia('test');
+        if (wikiResult && wikiResult.results.length > 0) {
+            return { ok: true, provider: 'wikipedia', instance: 'en.wikipedia.org', results: wikiResult.results.length };
+        }
+
+        return { ok: false, error: 'All search providers unreachable' };
     },
 
-    // --- Parse SearXNG JSON Results ---
-    // Converts SearXNG result objects to our internal format.
-    // SearXNG fields: url, title, content (snippet), engine, engines (array)
+    buildSearchContext(searchData) {
+        if (!searchData || !searchData.results || searchData.results.length === 0) {
+            return 'No web search results were found for this query.';
+        }
+
+        return searchData.results.map((r, i) => {
+            const title = r.title || 'Untitled';
+            const snippet = r.snippet || '';
+            const source = r.source || 'Unknown';
+            return `[${i + 1}] **${title}** (${source})\n${snippet}`;
+        }).join('\n\n');
+    },
+
+    _getCandidateInstances() {
+        if (!this._discoveredInstances || Date.now() >= this._discoveryExpiresAt) {
+            this._refreshDiscoveredInstances();
+        }
+
+        const combined = [this._lastWorkingInstance, ...this._instances, ...(this._discoveredInstances || [])];
+        return this._dedupeInstances(combined);
+    },
+
+    _dedupeInstances(instances) {
+        const seen = new Set();
+
+        return (instances || [])
+            .map(url => this._normalizeBaseUrl(url))
+            .filter(Boolean)
+            .filter(url => {
+                if (seen.has(url)) return false;
+                seen.add(url);
+                return true;
+            });
+    },
+
+    _refreshDiscoveredInstances() {
+        if (this._discoveryInFlight) return this._discoveryInFlight;
+
+        this._discoveryInFlight = this._fetchDiscoveredInstances()
+            .finally(() => {
+                this._discoveryInFlight = null;
+            });
+
+        return this._discoveryInFlight;
+    },
+
+    async _fetchDiscoveredInstances() {
+        const now = Date.now();
+        if (this._discoveredInstances && now < this._discoveryExpiresAt) {
+            return this._discoveredInstances;
+        }
+
+        try {
+            const response = await fetch('https://searx.space/data/instances.json', {
+                signal: AbortSignal.timeout(6000),
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+            const data = await response.json();
+            const instances = data?.instances || data;
+            const urls = [];
+
+            if (instances && typeof instances === 'object') {
+                for (const [url, info] of Object.entries(instances)) {
+                    const normalized = this._normalizeBaseUrl(url);
+                    if (!normalized || !normalized.startsWith('https://')) continue;
+                    if (info?.network_type && info.network_type !== 'normal') continue;
+                    if (info?.http?.grade && ['F', 'E'].includes(String(info.http.grade).toUpperCase())) continue;
+                    const searchTiming = info?.timing?.search;
+                    const successRate = Number(searchTiming?.success_percentage);
+                    const medianTime = Number(searchTiming?.all?.median ?? searchTiming?.server?.median);
+                    if (Number.isFinite(successRate) && successRate < 50) continue;
+                    if (Number.isFinite(medianTime) && medianTime > 8) continue;
+                    urls.push(normalized);
+                }
+            }
+
+            this._discoveredInstances = urls.slice(0, 25);
+            this._discoveryExpiresAt = now + (60 * 60 * 1000);
+            console.log(`[WebSearch] Discovered ${this._discoveredInstances.length} SearXNG instances`);
+            return this._discoveredInstances;
+        } catch (err) {
+            console.log(`[WebSearch] Instance discovery failed: ${err.message}`);
+            this._discoveredInstances = [];
+            this._discoveryExpiresAt = now + (10 * 60 * 1000);
+            return [];
+        }
+    },
+
     _parseSearXngResults(rawResults) {
         const results = [];
         const seenUrls = new Set();
 
         for (const r of rawResults) {
             if (!r.url || !r.title) continue;
-            if (seenUrls.has(r.url)) continue;
-            seenUrls.add(r.url);
 
-            // Extract source hostname from URL
-            let source = 'Unknown';
-            try {
-                source = new URL(r.url).hostname.replace(/^www\./, '');
-            } catch {}
+            const normalizedUrl = this._normalizeVisitUrl(r.url);
+            if (!normalizedUrl || seenUrls.has(normalizedUrl)) continue;
+            seenUrls.add(normalizedUrl);
 
-            // Use the engine field if available, otherwise use source
-            const engine = r.engine || (r.engines && r.engines[0]) || source;
+            const source = this._sourceFromUrl(normalizedUrl);
+            const engine = r.engine || (Array.isArray(r.engines) && r.engines[0]) || source;
 
             results.push({
                 title: this._cleanText(r.title),
-                url: r.url,
+                url: normalizedUrl,
                 snippet: this._cleanText(r.content || ''),
                 source,
                 engine,
@@ -126,73 +486,103 @@ const WebSearchAPI = {
         return results;
     },
 
-    // --- Clean text (strip HTML tags, decode entities) ---
     _cleanText(text) {
         if (!text) return '';
+        return this._decodeHtmlEntities(String(text).replace(/<[^>]+>/g, ' '))
+            .replace(/\s+/g, ' ')
+            .trim();
+    },
+
+    _normalizeBaseUrl(url) {
+        if (!url || typeof url !== 'string') return '';
+        try {
+            const parsed = new URL(url);
+            if (!/^https?:$/.test(parsed.protocol)) return '';
+            parsed.hash = '';
+            parsed.search = '';
+            return parsed.toString().replace(/\/+$/, '');
+        } catch {
+            return '';
+        }
+    },
+
+    _normalizeVisitUrl(url) {
+        if (!url || typeof url !== 'string') return '';
+        try {
+            const parsed = new URL(url.trim());
+            if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+            parsed.hash = '';
+            return parsed.toString();
+        } catch {
+            return '';
+        }
+    },
+
+    _extractTitle(html) {
+        const match = String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+        return match ? this._decodeHtmlEntities(match[1]).replace(/\s+/g, ' ').trim() : '';
+    },
+
+    _extractMetaDescription(html) {
+        const htmlText = String(html);
+        const match = htmlText.match(/<meta[^>]+(?:name|property)=["'](?:description|og:description)["'][^>]*content=["']([^"']*)["'][^>]*>/i)
+            || htmlText.match(/<meta[^>]+content=["']([^"']*)["'][^>]*(?:name|property)=["'](?:description|og:description)["'][^>]*>/i);
+        return match ? this._decodeHtmlEntities(match[1]).replace(/\s+/g, ' ').trim() : '';
+    },
+
+    _extractReadableText(html) {
+        return this._decodeHtmlEntities(String(html)
+            .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+            .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+            .replace(/<!--[\s\S]*?-->/g, ' ')
+            .replace(/<\/(p|div|section|article|header|footer|main|li|tr|h[1-6]|blockquote)>/gi, '\n')
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<[^>]+>/g, ' '))
+            .split('\n')
+            .map(line => line.replace(/\s+/g, ' ').trim())
+            .filter(Boolean)
+            .join('\n')
+            .trim();
+    },
+
+    _cleanPlainText(text) {
+        return this._decodeHtmlEntities(String(text))
+            .replace(/\r/g, '')
+            .replace(/[ \t]+/g, ' ')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+    },
+
+    _decodeHtmlEntities(text) {
+        if (!text) return '';
         return String(text)
+            .replace(/&nbsp;/g, ' ')
             .replace(/&amp;/g, '&')
             .replace(/&lt;/g, '<')
             .replace(/&gt;/g, '>')
             .replace(/&quot;/g, '"')
             .replace(/&#39;/g, "'")
             .replace(/&#x27;/g, "'")
-            .replace(/<[^>]+>/g, '')
-            .trim();
+            .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+            .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(parseInt(code, 16)));
     },
 
-    // --- Test Connection ---
-    // Tests if any SearXNG instance is reachable and returns parseable JSON results.
-    async testConnection() {
-        for (const baseUrl of this._instances) {
-            try {
-                const url = `${baseUrl}/search?q=test&format=json`;
-                const response = await fetch(url, {
-                    signal: AbortSignal.timeout(10000),
-                    // No custom headers — avoid CORS preflight failures.
-                    // format=json URL parameter already requests JSON output.
-                });
-
-                if (!response.ok) {
-                    console.log(`[WebSearch] Test: ${baseUrl} HTTP ${response.status}`);
-                    continue;
-                }
-
-                // Read as text first, then parse as JSON. Content-type header
-                // is unreliable — many SearXNG instances return text/html for JSON.
-                const text = await response.text();
-                let data;
-                try {
-                    data = JSON.parse(text);
-                } catch (parseErr) {
-                    console.log(`[WebSearch] Test: ${baseUrl} returned non-JSON response`);
-                    continue;
-                }
-                if (data && Array.isArray(data.results)) {
-                    return { ok: true, instance: baseUrl, results: data.results.length };
-                }
-            } catch (err) {
-                const errType = err.name || 'Error';
-                console.log(`[WebSearch] Test: ${baseUrl} failed: [${errType}] ${err.message}`);
-            }
+    _sourceFromUrl(url) {
+        try {
+            return new URL(url).hostname.replace(/^www\./, '');
+        } catch {
+            return 'Unknown';
         }
-
-        return { ok: false, error: 'All SearXNG instances unreachable' };
     },
 
-    // --- Build search context for LLM ---
-    // Formats search results into a text block that can be injected into the LLM prompt.
-    buildSearchContext(searchData) {
-        if (!searchData || !searchData.results || searchData.results.length === 0) {
-            return 'No web search results were found for this query.';
+    _titleFromUrl(url) {
+        try {
+            const parsed = new URL(url);
+            return `${parsed.hostname.replace(/^www\./, '')}${parsed.pathname.replace(/\/$/, '')}`;
+        } catch {
+            return 'Untitled page';
         }
-
-        const lines = searchData.results.map((r, i) => {
-            const title = r.title || 'Untitled';
-            const snippet = r.snippet || '';
-            const source = r.source || 'Unknown';
-            return `[${i + 1}] **${title}** (${source})\n${snippet}`;
-        });
-
-        return lines.join('\n\n');
     },
 };
