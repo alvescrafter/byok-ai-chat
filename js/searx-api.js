@@ -33,42 +33,80 @@ const WebSearchAPI = {
             throw new Error('Query is required');
         }
 
+        const deadline = Date.now() + 18000;
         const candidates = this._getCandidateInstances();
 
         // Fast tier: try the first few SearXNG instances + DuckDuckGo + Wikipedia
         // in parallel. This ensures fallback providers are reached quickly even
         // when all SearXNG instances are rate-limited or down (the common case).
         const fastBatch = candidates.slice(0, 4);
-        const fastPromises = [
-            ...fastBatch.map(baseUrl => this._searchInstance(baseUrl, query)),
+        const fastResult = await this._firstSuccessfulSearch([
             this._searchDuckDuckGo(query),
             this._searchWikipedia(query),
-        ];
-        const fastResults = await Promise.all(fastPromises);
-        for (const result of fastResults) {
-            if (result && result.results.length > 0) return result;
-        }
+            ...fastBatch.map(baseUrl => this._searchInstance(baseUrl, query)),
+        ], 12000);
+        if (fastResult) return fastResult;
 
         console.log('[WebSearch] Fast tier exhausted; trying remaining SearXNG instances');
 
         // Slow tier: remaining curated SearXNG instances, sequentially
-        const remaining = candidates.slice(4);
+        const remaining = candidates.slice(4, 7);
         for (const baseUrl of remaining) {
+            if (Date.now() > deadline - 1000) break;
             const result = await this._searchInstance(baseUrl, query);
             if (result) return result;
         }
 
         // Last resort: refresh discovered instances and try new ones
+        if (Date.now() > deadline - 8000) {
+            console.log('[WebSearch] Search deadline reached before discovery fallback');
+            return { results: [], query, provider: 'none' };
+        }
+
         const discovered = await this._refreshDiscoveredInstances();
         const known = new Set(candidates);
-        const newCandidates = this._dedupeInstances(discovered || []).filter(url => !known.has(url));
+        const newCandidates = this._dedupeInstances(discovered || []).filter(url => !known.has(url)).slice(0, 2);
         for (const baseUrl of newCandidates) {
+            if (Date.now() > deadline - 1000) break;
             const result = await this._searchInstance(baseUrl, query);
             if (result) return result;
         }
 
         console.log('[WebSearch] All search providers failed');
         return { results: [], query, provider: 'none' };
+    },
+
+    async _firstSuccessfulSearch(promises, timeoutMs) {
+        return new Promise((resolve) => {
+            let pending = promises.length;
+            let settled = false;
+            const timeoutId = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                resolve(null);
+            }, timeoutMs);
+
+            for (const promise of promises) {
+                Promise.resolve(promise)
+                    .then((result) => {
+                        if (settled) return;
+                        if (result && Array.isArray(result.results) && result.results.length > 0) {
+                            settled = true;
+                            clearTimeout(timeoutId);
+                            resolve(result);
+                        }
+                    })
+                    .catch(() => {})
+                    .finally(() => {
+                        pending--;
+                        if (!settled && pending <= 0) {
+                            settled = true;
+                            clearTimeout(timeoutId);
+                            resolve(null);
+                        }
+                    });
+            }
+        });
     },
 
     async _searchDuckDuckGo(query) {

@@ -256,7 +256,8 @@ const App = (() => {
         }
 
         // Save user message
-        const savedMsg = await Storage.addMessage(currentConversationId, userMessage);
+        const conversationIdForSend = currentConversationId;
+        const savedMsg = await Storage.addMessage(conversationIdForSend, userMessage);
         renderUserMessage(savedMsg);
 
         // Clear input and attachments
@@ -268,7 +269,7 @@ const App = (() => {
         hideWelcomeScreen();
 
         // Build messages array for API
-        const conversation = await Storage.getConversation(currentConversationId);
+        const conversation = await Storage.getConversation(conversationIdForSend);
         const messages = buildApiMessages(conversation);
 
         // Start streaming (with or without web search)
@@ -279,8 +280,8 @@ const App = (() => {
         }
 
         // Generate title if first message
-        if (conversation.messages.length <= 1) {
-            generateTitle(messages);
+        if (shouldAutoTitleConversation(conversation)) {
+            generateTitle(conversationIdForSend, userMessage);
         }
     }
 
@@ -357,10 +358,10 @@ Use current dates in the query when recency matters. Return ONLY the search quer
             const planResponse = await callLLM(planningMessages, { temperature: 0.3, maxTokens: 150, timeout: 20000 });
             removeSearchStatus(planningEl);
 
-            let queries = parsePlannedQueries(planResponse);
+            let queries = parsePlannedQueries(planResponse).map(normalizeSearchQuery).filter(Boolean);
             if (queries.length === 0) {
                 console.log('[WebSearch] No queries parsed from LLM response, using user question as fallback');
-                queries = [userContent.slice(0, 200)];
+                queries = [normalizeSearchQuery(userContent) || userContent.slice(0, 160)];
             }
 
             const allResults = [];
@@ -379,7 +380,7 @@ Use current dates in the query when recency matters. Return ONLY the search quer
                     const action = actions.shift();
 
                     if (action.type === 'search') {
-                        const query = action.value.trim();
+                        const query = normalizeSearchQuery(action.value);
                         if (!query || usedQueries.has(query.toLowerCase()) || searchCount >= maxSearches) continue;
                         usedQueries.add(query.toLowerCase());
                         searchedQueries.push(query);
@@ -525,6 +526,38 @@ Use current dates in the query when recency matters. Return ONLY the search quer
             });
     }
 
+    function normalizeSearchQuery(query) {
+        let cleaned = String(query || '');
+
+        cleaned = cleaned
+            .replace(/\[[0-9:]+\]\([^)]*\)/g, ' ')
+            .replace(/\[[^\]]+\]\((https?:\/\/[^)]+)\)/g, ' $1 ')
+            .replace(/https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be)\/\S+/gi, ' ')
+            .replace(/https?:\/\/\S+/gi, ' ')
+            .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, ' ')
+            .replace(/\([^)]*youtu(?:be\.com|\.be)[^)]*\)/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        if (!cleaned) return '';
+
+        const sentences = cleaned
+            .split(/(?<=[.!?])\s+/)
+            .map(part => part.trim())
+            .filter(part => part.length > 0);
+
+        if (sentences.length > 0) {
+            cleaned = sentences.slice(0, 2).join(' ');
+        }
+
+        if (cleaned.length > 160) {
+            const trimmed = cleaned.slice(0, 160);
+            cleaned = trimmed.slice(0, Math.max(trimmed.lastIndexOf(' '), 80)).trim() || trimmed.trim();
+        }
+
+        return cleaned;
+    }
+
     function buildResearchReviewMessages(context) {
         const {
             userContent,
@@ -590,7 +623,7 @@ Use VISIT when a search result looks relevant but snippets are not enough. Use S
         for (const line of lines) {
             const searchMatch = line.match(/^SEARCH:\s*(.+)$/i);
             if (searchMatch) {
-                actions.push({ type: 'search', value: searchMatch[1].trim() });
+                actions.push({ type: 'search', value: normalizeSearchQuery(searchMatch[1]) });
                 continue;
             }
 
@@ -1299,19 +1332,67 @@ Use the above search results to inform your answer. Cite sources using [number] 
     }
 
     // --- Generate Title ---
-    async function generateTitle(messages) {
+    function shouldAutoTitleConversation(conversation) {
+        if (!conversation || (conversation.messages || []).length > 1) return false;
+        return hasDefaultConversationTitle(conversation);
+    }
+
+    function hasDefaultConversationTitle(conversation) {
+        if (!conversation) return false;
+        const title = (conversation.title || '').trim().toLowerCase();
+        return !title || title === 'new chat' || title === 'untitled';
+    }
+
+    function buildTitleSeed(message) {
+        let content = message?.content || '';
+
+        content = content
+            .replace(/\[Page Context\][\s\S]*?\[\/Page Context\]/gi, ' ')
+            .replace(/\[[0-9:]+\]\([^)]*\)/g, ' ')
+            .replace(/\[[^\]]+\]\((https?:\/\/[^)]+)\)/g, ' ')
+            .replace(/https?:\/\/\S+/gi, ' ')
+            .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        if (!content && message?.files?.length) {
+            const fileNames = message.files.map(file => file.name).filter(Boolean).join(', ');
+            content = fileNames ? `Files: ${fileNames}` : 'Uploaded files';
+        }
+
+        return content.slice(0, 1200) || 'New conversation';
+    }
+
+    function cleanGeneratedTitle(title) {
+        return String(title || '')
+            .replace(/^["'`]+|["'`]+$/g, '')
+            .replace(/[.!?]+$/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 80);
+    }
+
+    async function generateTitle(conversationId, firstMessage) {
         try {
+            const provider = $('provider-select').value;
+            const model = $('model-select').value;
+            const titleMessages = [{ role: 'user', content: buildTitleSeed(firstMessage) }];
+
             chrome.runtime.sendMessage({
                 type: 'GENERATE_TITLE',
-                messages: messages.slice(0, 2),
-                provider: $('provider-select').value,
-                model: $('model-select').value,
+                messages: titleMessages,
+                provider,
+                model,
                 settings,
-            }, (response) => {
-                if (response?.success && response.title && currentConversationId) {
-                    Storage.updateConversation(currentConversationId, { title: response.title });
-                    loadConversationList();
-                }
+            }, async (response) => {
+                const title = cleanGeneratedTitle(response?.title);
+                if (!response?.success || !title || title.toLowerCase() === 'new chat') return;
+
+                const latest = await Storage.getConversation(conversationId);
+                if (!hasDefaultConversationTitle(latest)) return;
+
+                await Storage.updateConversation(conversationId, { title });
+                loadConversationList();
             });
         } catch (e) { /* ignore */ }
     }
