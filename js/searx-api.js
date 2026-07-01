@@ -75,12 +75,13 @@ const WebSearchAPI = {
         try {
             const params = new URLSearchParams({
                 q: query,
-                format: 'json',
-                no_html: '1',
-                skip_disambig: '1',
             });
-            const url = `https://api.duckduckgo.com/?${params.toString()}`;
+            const url = `https://html.duckduckgo.com/html/?${params.toString()}`;
             const response = await fetch(url, {
+                headers: {
+                    'Accept': 'text/html,application/xhtml+xml,text/plain;q=0.8,*/*;q=0.5',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                },
                 signal: AbortSignal.timeout(10000),
             });
 
@@ -90,49 +91,7 @@ const WebSearchAPI = {
             }
 
             const text = await response.text();
-            let data;
-            try {
-                data = JSON.parse(text);
-            } catch {
-                console.log('[WebSearch] DuckDuckGo returned non-JSON response');
-                return null;
-            }
-
-            const results = [];
-            const seenUrls = new Set();
-
-            if (data.Abstract && data.AbstractURL) {
-                const absUrl = this._normalizeVisitUrl(data.AbstractURL);
-                if (absUrl && !seenUrls.has(absUrl)) {
-                    seenUrls.add(absUrl);
-                    results.push({
-                        title: this._cleanText(data.Heading || data.Abstract.split('.')[0] || 'DuckDuckGo Answer'),
-                        url: absUrl,
-                        snippet: this._cleanText(data.Abstract),
-                        source: this._sourceFromUrl(absUrl),
-                        engine: 'duckduckgo',
-                    });
-                }
-            }
-
-            const topics = Array.isArray(data.RelatedTopics) ? data.RelatedTopics : [];
-            for (const topic of topics) {
-                if (results.length >= 10) break;
-                if (!topic || typeof topic !== 'object') continue;
-                if (topic.Topics) continue;
-                if (!topic.FirstURL || !topic.Text) continue;
-                const tUrl = this._normalizeVisitUrl(topic.FirstURL);
-                if (!tUrl || seenUrls.has(tUrl)) continue;
-                seenUrls.add(tUrl);
-                const textParts = String(topic.Text).split(' - ');
-                results.push({
-                    title: this._cleanText(textParts[0] || topic.Text),
-                    url: tUrl,
-                    snippet: this._cleanText(topic.Text),
-                    source: this._sourceFromUrl(tUrl),
-                    engine: 'duckduckgo',
-                });
-            }
+            const results = this._parseDuckDuckGoHtmlResults(text);
 
             if (results.length === 0) {
                 console.log('[WebSearch] DuckDuckGo returned 0 parseable results');
@@ -140,11 +99,53 @@ const WebSearchAPI = {
             }
 
             console.log(`[WebSearch] DuckDuckGo returned ${results.length} results`);
-            return { results, query, provider: 'duckduckgo', instance: 'api.duckduckgo.com' };
+            return { results, query, provider: 'duckduckgo', instance: 'html.duckduckgo.com' };
         } catch (err) {
             const errType = err.name || 'Error';
             console.log(`[WebSearch] DuckDuckGo failed: [${errType}] ${err.message}`);
             return null;
+        }
+    },
+
+    _parseDuckDuckGoHtmlResults(html) {
+        const results = [];
+        const seenUrls = new Set();
+        const blocks = String(html).split(/<div class="result results_links/i).slice(1);
+
+        for (const block of blocks) {
+            if (results.length >= 10) break;
+
+            const linkMatch = block.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+            if (!linkMatch) continue;
+
+            const url = this._decodeDuckDuckGoResultUrl(linkMatch[1]);
+            const normalizedUrl = this._normalizeVisitUrl(url);
+            if (!normalizedUrl || seenUrls.has(normalizedUrl)) continue;
+
+            const snippetMatch = block.match(/<(?:a|div)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/(?:a|div)>/i);
+            seenUrls.add(normalizedUrl);
+            results.push({
+                title: this._cleanText(linkMatch[2]),
+                url: normalizedUrl,
+                snippet: snippetMatch ? this._cleanText(snippetMatch[1]) : '',
+                source: this._sourceFromUrl(normalizedUrl),
+                engine: 'duckduckgo',
+            });
+        }
+
+        return results;
+    },
+
+    _decodeDuckDuckGoResultUrl(href) {
+        if (!href) return '';
+
+        try {
+            const absolute = href.startsWith('//') ? `https:${href}` : href;
+            const parsed = new URL(absolute, 'https://duckduckgo.com');
+            const uddg = parsed.searchParams.get('uddg');
+            return uddg ? decodeURIComponent(uddg) : parsed.href;
+        } catch {
+            return '';
         }
     },
 
@@ -358,7 +359,7 @@ const WebSearchAPI = {
 
         const ddgResult = await this._searchDuckDuckGo('test');
         if (ddgResult && ddgResult.results.length > 0) {
-            return { ok: true, provider: 'duckduckgo', instance: 'api.duckduckgo.com', results: ddgResult.results.length };
+            return { ok: true, provider: 'duckduckgo', instance: 'html.duckduckgo.com', results: ddgResult.results.length };
         }
 
         const wikiResult = await this._searchWikipedia('test');
